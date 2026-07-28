@@ -32,7 +32,7 @@ fi
 
 status=0
 
-for f in message segment session stream_frame limits auth safety; do
+for f in message segment session stream_frame limits auth safety diag; do
     a="$src/src/$f.c"
     b="$here/third_party/cbplc/src/$f.c"
     [ -f "$a" ] || continue
@@ -42,7 +42,7 @@ for f in message segment session stream_frame limits auth safety; do
     fi
 done
 
-for h in message segment session stream_frame transport protocol_generated limits auth safety; do
+for h in message segment session stream_frame transport protocol_generated limits auth safety diag; do
     a="$src/include/cbplc/$h.h"
     b="$here/third_party/cbplc/include/cbplc/$h.h"
     [ -f "$a" ] || continue

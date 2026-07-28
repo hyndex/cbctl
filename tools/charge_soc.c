@@ -134,6 +134,30 @@ static void on_sig(int s) { (void)s; g_stop = 1; }
  * COST
  *   ~2.5 KB per poll, ~1 poll/s => ~9 MB/hour, on a Pi with a disk. Off unless CBCTL_SESSION_LOG
  *   names a file, because a bench tool that silently fills a production disk is its own incident. */
+/* ---- the board's own log, pulled over the protocol ------------------------------------------
+ *
+ * CBCTL_DIAG_LOG=<file> arms it; CBCTL_DIAG_V2G=1 additionally turns on cbplc's per-message
+ * decoded HLC trace, which is the thing to reach for when a PARTICULAR vehicle refuses a
+ * charger that works with every other one.
+ *
+ * Off by default and deliberately so. The trace is roughly 100 bytes a message and 40-60
+ * messages a session, and cbctl only drains between sessions — never while a contactor is held
+ * — so arming it costs nothing during delivery and everything is still there afterwards,
+ * because the board's ring holds the whole session.
+ *
+ * The sink appends raw bytes and nothing else. No line assembly: a drain boundary can fall
+ * mid-line, and re-framing here would mean buffering on the control thread for no benefit that
+ * `tail -f` does not already provide. */
+static FILE *g_diaglog;
+
+static void diag_sink(const uint8_t *bytes, uint16_t len, void *user)
+{
+    (void)user;
+    if (g_diaglog != NULL && len != 0u) {
+        (void)fwrite(bytes, 1u, len, g_diaglog);
+    }
+}
+
 static FILE *g_rec;
 static uint32_t g_rec_t0;
 
@@ -298,6 +322,34 @@ int main(int argc, char **argv)
     {
         const char *tr = getenv("CBCTL_TRACE_STATUS");
         rec_open(getenv("CBCTL_SESSION_LOG"));
+        {
+            const char *dl = getenv("CBCTL_DIAG_LOG");
+            if (dl != NULL && dl[0] != '\0') {
+                g_diaglog = fopen(dl, "we");
+                if (g_diaglog == NULL) {
+                    fprintf(stderr, "diag log: cannot open %s: %s\n", dl, strerror(errno));
+                } else {
+                    const char *v2g = getenv("CBCTL_DIAG_V2G");
+                    const int want_v2g = (v2g != NULL && v2g[0] == '1');
+                    /* Line-buffered for the same reason as the session recorder: a log that
+                     * only appears after the process dies is useless exactly when it matters. */
+                    setvbuf(g_diaglog, NULL, _IOLBF, 0);
+                    (void)cbctl_diag_enable(&link, true, diag_sink, NULL);
+                    /* Start from an empty ring so this session's trace cannot be prefixed with
+                     * the tail of the previous vehicle's. */
+                    (void)cbctl_diag_clear(&link);
+                    (void)cbctl_diag_set_level(&link, CBCTL_DIAG_INFO);
+                    (void)cbctl_diag_set_categories(
+                        &link, want_v2g ? (CBCTL_DIAG_CAT_CORE | CBCTL_DIAG_CAT_V2G |
+                                           CBCTL_DIAG_CAT_SLAC | CBCTL_DIAG_CAT_CP |
+                                           CBCTL_DIAG_CAT_RELAY)
+                                        : (CBCTL_DIAG_CAT_CORE | CBCTL_DIAG_CAT_SLAC |
+                                           CBCTL_DIAG_CAT_CP | CBCTL_DIAG_CAT_RELAY));
+                    printf("board log -> %s%s\n", dl,
+                           want_v2g ? "  (V2G trace armed)" : "");
+                }
+            }
+        }
         /* The observer is what feeds BOTH the phase watchdog and the recorder, so it must be
          * installed whenever either is wanted — not only when a human asked for console tracing. */
         if (tr != NULL || g_rec != NULL) {
@@ -921,6 +973,46 @@ int main(int argc, char **argv)
         power_group_debug(&g_ga, &g_gact, &g_gon, &g_gflt, &g_grv, &g_gra);
             (void)poll(NULL, 0, 40);
         }
+    }
+
+    /* DRAIN THE BOARD'S LOG BEFORE EXITING, or the run that most needed it has none.
+     *
+     * cbctl suppresses draining for the whole time a contactor is held or a session is live —
+     * correctly, because a round trip spent on log text during delivery comes out of the feed
+     * and lease budget. The consequence is that a charge which runs to completion has its ENTIRE
+     * trace still sitting in the board's ring at the moment this process would otherwise exit,
+     * and it would be lost to the next CLEAR or simply overwritten.
+     *
+     * By here the relays are open, the stop is latched and there is no session, so the wire is
+     * ours and the drain costs nothing. Bounded, because a bench tool may not hang on a board
+     * that has stopped answering: `pending` reaching zero ends it early, and the deadline ends
+     * it regardless. What could not be drained is REPORTED rather than passed over — a truncated
+     * trace that looks complete is worse than no trace. */
+    if (g_diaglog != NULL) {
+        const uint32_t d0 = now_ms();
+        uint32_t pending = 0u;
+        printf("draining the board's log...\n");
+        while (now_ms() - d0 < 15000u) {
+            cbctl_tick(&link, now_ms());
+            (void)poll(NULL, 0, 20);
+            if (cbctl_diag_state(&link, NULL, NULL, NULL, &pending) && pending == 0u &&
+                now_ms() - d0 > 2000u) {
+                break;
+            }
+        }
+        {
+            uint32_t dropped = 0u;
+            (void)cbctl_diag_state(&link, NULL, NULL, &dropped, &pending);
+            printf("  board log: %u bytes drained, %u still pending, %u dropped by the board\n",
+                   link.diag_bytes, pending, dropped);
+            if (dropped != 0u) {
+                printf("  WARNING: the board's ring lapped — this trace has HOLES and is not "
+                       "complete evidence\n");
+            }
+        }
+        (void)fflush(g_diaglog);
+        (void)fclose(g_diaglog);
+        g_diaglog = NULL;
     }
 
     printf("\n=== result ===\n");

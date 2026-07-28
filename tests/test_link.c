@@ -945,6 +945,320 @@ TEST(a_standing_relay_refusal_backs_off)
     printf("    %u refusals over 3s of ticks (unbounded would be ~60)\n", link.relay_refusals);
 }
 
+
+/* ---- board diagnostics ---------------------------------------------------------------------
+ *
+ * The properties under test are the ones that make diagnostics safe to ship on a charger: they
+ * never compete with energy, they never wedge, and they never let a gap look like silence.
+ */
+/* Internal, and deliberately not in the public header: a caller does not decide when a board
+ * has reset — the reset detection does. Declared here so the test can drive that path. */
+void cbctl_link_reestablish(cbctl_link_t *link);
+
+static uint8_t g_sink_buf[8192];
+static size_t g_sink_len;
+static unsigned g_sink_calls;
+
+static void test_sink(const uint8_t *bytes, uint16_t len, void *user)
+{
+    (void)user;
+    if (g_sink_len + len <= sizeof g_sink_buf) {
+        memcpy(&g_sink_buf[g_sink_len], bytes, len);
+        g_sink_len += len;
+    }
+    g_sink_calls++;
+}
+
+static void seed_log(cbctl_loopback_t *lb, const char *text)
+{
+    const size_t n = strlen(text);
+    lb->diag_control = true;
+    memcpy(lb->diag_text, text, n);
+    lb->diag_len = (uint32_t)n;
+    lb->diag_taken = 0u;
+}
+
+/* Off unless asked. A controller that never mentions diagnostics must put nothing extra on the
+ * wire — the fleet runs controllers that will never call these functions. */
+TEST(diagnostics_are_silent_until_enabled)
+{
+    cbctl_link_t link;
+    cbctl_loopback_t lb;
+    uint32_t now = 1000u;
+
+    bring_up(&link, &lb, &now);
+    seed_log(&lb, "[1] I secc: vehicle connected\n");
+    for (int i = 0; i < 200; i++) { round_trip(&link, &lb, &now, 100u); }
+    CHECK(lb.diag_drains_seen == 0u);
+    CHECK(lb.diag_ctl_seen == 0u);
+    CHECK(!cbctl_diag_state(&link, NULL, NULL, NULL, NULL));
+}
+
+/* Arming without somewhere to put the bytes is refused: a drain is DESTRUCTIVE, so enabling
+ * with no sink would consume the very evidence it was turned on to collect. */
+TEST(arming_without_a_sink_is_refused)
+{
+    cbctl_link_t link;
+    cbctl_loopback_t lb;
+    uint32_t now = 1000u;
+
+    bring_up(&link, &lb, &now);
+    CHECK(cbctl_diag_enable(&link, true, NULL, NULL) == CBCTL_E_ARG);
+    CHECK(cbctl_diag_enable(&link, true, test_sink, NULL) == CBCTL_OK);
+    CHECK(cbctl_diag_enable(&link, false, NULL, NULL) == CBCTL_OK);
+}
+
+TEST(an_armed_drain_reaches_the_sink_verbatim)
+{
+    cbctl_link_t link;
+    cbctl_loopback_t lb;
+    uint32_t now = 1000u;
+    static const char kLog[] = "[1] I secc: vehicle connected\n[2] W relay: lease LAPSED\n";
+
+    g_sink_len = 0u; g_sink_calls = 0u;
+    bring_up(&link, &lb, &now);
+    seed_log(&lb, kLog);
+    CHECK(cbctl_diag_enable(&link, true, test_sink, NULL) == CBCTL_OK);
+    for (int i = 0; i < 40; i++) { round_trip(&link, &lb, &now, 100u); }
+
+    CHECK(g_sink_len == strlen(kLog));
+    CHECK(memcmp(g_sink_buf, kLog, g_sink_len) == 0);
+    CHECK(cbctl_diag_control_supported(&link));
+}
+
+/* THE LOAD-BEARING ONE. While a contactor is held or a session is live, cbctl must not spend a
+ * round trip on log text: cbplc is stop-and-wait, and that round trip comes out of the feed and
+ * lease budget. Nothing is lost by waiting — the board's ring holds the session. */
+TEST(no_drain_competes_with_a_live_charge)
+{
+    cbctl_link_t link;
+    cbctl_loopback_t lb;
+    uint32_t now = 1000u;
+    unsigned drains_during;
+
+    g_sink_len = 0u; g_sink_calls = 0u;
+    bring_up(&link, &lb, &now);
+    seed_log(&lb, "[1] I v2g CurrentDemand\n");
+    CHECK(cbctl_diag_enable(&link, true, test_sink, NULL) == CBCTL_OK);
+    /* Let the control probe and any first drain settle before the charge starts. */
+    for (int i = 0; i < 20; i++) { round_trip(&link, &lb, &now, 100u); }
+
+    lb.secc_active = true;
+    CHECK(cbctl_relay_close(&link, CBPLC_RELAY_GUN, 3000u, NULL) == CBCTL_OK);
+    for (int i = 0; i < 40; i++) { round_trip(&link, &lb, &now, 100u); }
+    drains_during = lb.diag_drains_seen;
+
+    for (int i = 0; i < 200; i++) { round_trip(&link, &lb, &now, 100u); }
+    printf("    drains during charge: %u (suppressed %u)\n",
+           lb.diag_drains_seen - drains_during, link.diag_suppressed);
+    CHECK(lb.diag_drains_seen == drains_during);
+    CHECK(link.diag_suppressed > 0u);
+
+    /* And it resumes the moment the energy path is released, so a failed session's log is
+     * still recoverable. */
+    seed_log(&lb, "[9] W secc: session ended\n");
+    lb.secc_active = false;
+    CHECK(cbctl_relay_open(&link, CBPLC_RELAY_ALL, NULL) == CBCTL_OK);
+    for (int i = 0; i < 60; i++) { round_trip(&link, &lb, &now, 100u); }
+    CHECK(lb.diag_drains_seen > drains_during);
+}
+
+/* A quiet board must not cost a round trip a second forever, and a board with a backlog must
+ * not be drained at the idle rate. */
+TEST(an_empty_board_backs_off_and_a_backlog_speeds_up)
+{
+    cbctl_link_t link;
+    cbctl_loopback_t lb;
+    uint32_t now = 1000u;
+    unsigned quiet_drains;
+
+    g_sink_len = 0u; g_sink_calls = 0u;
+    bring_up(&link, &lb, &now);
+    lb.diag_control = true;
+    CHECK(cbctl_diag_enable(&link, true, test_sink, NULL) == CBCTL_OK);
+
+    /* Nothing to say for thirty seconds. */
+    for (int i = 0; i < 300; i++) { round_trip(&link, &lb, &now, 100u); }
+    quiet_drains = lb.diag_drains_seen;
+    printf("    drains over 30 s idle: %u  (period now %u ms)\n",
+           quiet_drains, link.diag_period_ms);
+    CHECK(link.diag_period_ms == CBCTL_DIAG_PERIOD_MAX_MS);
+    /* At the 8 s ceiling, thirty seconds is a handful of polls — not three hundred. */
+    CHECK(quiet_drains < 20u);
+
+    /* Now give it a full chunk: the reply is at the board's per-drain cap, which is evidence of
+     * more waiting even from a firmware too old to report `pending`. */
+    {
+        static char big[2500];
+        memset(big, 'x', sizeof big - 1u);
+        big[sizeof big - 1u] = '\0';
+        seed_log(&lb, big);
+    }
+    /* BEHAVIOUR, NOT THE VARIABLE. Once content appears, the whole backlog must arrive
+     * promptly — three chunk-sized replies at the floor, not three at the 8 s ceiling. The
+     * assertion is on elapsed ticks so it stays true if the pacing is ever retuned. */
+    {
+        int ticks = 0;
+        while (ticks < 400 && g_sink_len < 2499u) {
+            round_trip(&link, &lb, &now, 100u);
+            ticks++;
+        }
+        printf("    backlog of 2499 B drained in %d ticks (100 ms each)\n", ticks);
+        CHECK(g_sink_len == 2499u);
+        /* At the ceiling this would need ~240 ticks; at the floor, well under 100. */
+        CHECK(ticks < 120);
+    }
+}
+
+/* Level and categories are INTENTS confirmed by readback, not fire-and-forget. */
+TEST(the_level_and_categories_are_confirmed_by_the_board)
+{
+    cbctl_link_t link;
+    cbctl_loopback_t lb;
+    uint32_t now = 1000u;
+    uint8_t level = 0xFFu;
+    uint32_t cats = 0u, dropped = 0u, pending = 0u;
+
+    bring_up(&link, &lb, &now);
+    lb.diag_control = true;
+    CHECK(cbctl_diag_enable(&link, true, test_sink, NULL) == CBCTL_OK);
+    CHECK(cbctl_diag_set_level(&link, CBCTL_DIAG_WARN) == CBCTL_OK);
+    CHECK(cbctl_diag_set_categories(&link, CBCTL_DIAG_CAT_V2G) == CBCTL_OK);
+    for (int i = 0; i < 40; i++) { round_trip(&link, &lb, &now, 100u); }
+
+    CHECK(lb.diag_level == (uint8_t)CBCTL_DIAG_WARN);
+    CHECK(lb.diag_categories == CBCTL_DIAG_CAT_V2G);
+    CHECK(cbctl_diag_state(&link, &level, &cats, &dropped, &pending));
+    CHECK(level == (uint8_t)CBCTL_DIAG_WARN);
+    CHECK(cats == CBCTL_DIAG_CAT_V2G);
+    CHECK(!link.diag_level_dirty);
+    CHECK(!link.diag_cats_dirty);
+    /* An out-of-range level never reaches the wire. */
+    CHECK(cbctl_diag_set_level(&link, (cbctl_diag_level_t)9) == CBCTL_E_ARG);
+}
+
+/* THE COMPATIBILITY CASE. An older firmware answers a control request by DRAINING, so the reply
+ * is log text. cbctl must notice, stop asking, keep the bytes, and keep draining — a board that
+ * cannot be configured is still a board worth reading. */
+TEST(an_old_firmware_that_drains_control_requests_is_handled)
+{
+    cbctl_link_t link;
+    cbctl_loopback_t lb;
+    uint32_t now = 1000u;
+    static const char kLog[] = "[1] I ancient firmware speaking\n";
+
+    g_sink_len = 0u; g_sink_calls = 0u;
+    bring_up(&link, &lb, &now);
+    seed_log(&lb, kLog);
+    lb.diag_control = false;              /* the old board */
+
+    CHECK(cbctl_diag_enable(&link, true, test_sink, NULL) == CBCTL_OK);
+    CHECK(cbctl_diag_set_level(&link, CBCTL_DIAG_WARN) == CBCTL_OK);
+    for (int i = 0; i < 80; i++) { round_trip(&link, &lb, &now, 100u); }
+
+    CHECK(!cbctl_diag_control_supported(&link));
+    CHECK(!cbctl_diag_state(&link, NULL, NULL, NULL, NULL));
+    /* The text the old board handed back on the "control" request was NOT thrown away. */
+    CHECK(g_sink_len == strlen(kLog));
+    CHECK(memcmp(g_sink_buf, kLog, g_sink_len) == 0);
+    /* And it stopped arguing: the try budget is finite, so it is not one round trip per tick
+     * for the life of the controller. */
+    CHECK(lb.diag_ctl_seen == 0u);
+    CHECK(link.diag_ctl_tries <= CBCTL_DIAG_CTL_TRIES);
+}
+
+/* A LOST DIAG REPLY MUST NOT WEDGE DIAGNOSTICS. diag_req_pending is what stops a second drain
+ * while one is outstanding, and a timed-out request never reaches the reply path. */
+TEST(a_swallowed_diag_reply_does_not_wedge_the_drain)
+{
+    cbctl_link_t link;
+    cbctl_loopback_t lb;
+    uint32_t now = 1000u;
+    unsigned before;
+
+    g_sink_len = 0u; g_sink_calls = 0u;
+    bring_up(&link, &lb, &now);
+    seed_log(&lb, "[1] I still here\n");
+    CHECK(cbctl_diag_enable(&link, true, test_sink, NULL) == CBCTL_OK);
+
+    lb.swallow_type = (uint8_t)CBPLC_T_DIAG;   /* received, never answered */
+    for (int i = 0; i < 120; i++) { round_trip(&link, &lb, &now, 100u); }
+    /* The board's counter cannot move here: swallow_type drops the request before the handler
+     * ever sees it, which is the point. cbctl's OWN attempt counter is the evidence that it
+     * kept issuing rather than latching diag_req_pending and going quiet forever. */
+    before = link.diag_drains;
+    CHECK(before > 1u);
+
+    lb.swallow_type = 0u;                      /* board recovers */
+    for (int i = 0; i < 120; i++) { round_trip(&link, &lb, &now, 100u); }
+    CHECK(link.diag_drains > before);
+    CHECK(lb.diag_drains_seen > 0u);
+    CHECK(g_sink_len > 0u);                    /* and the text finally arrived */
+}
+
+/* A board reset loses the level and the categories, because cbplc deliberately does not persist
+ * them. A controller that did not re-assert would believe a trace was running against a board
+ * recording nothing, and would read the silence as evidence. */
+TEST(a_board_reset_re_arms_the_trace)
+{
+    cbctl_link_t link;
+    cbctl_loopback_t lb;
+    uint32_t now = 1000u;
+
+    bring_up(&link, &lb, &now);
+    lb.diag_control = true;
+    CHECK(cbctl_diag_enable(&link, true, test_sink, NULL) == CBCTL_OK);
+    CHECK(cbctl_diag_set_categories(&link, CBCTL_DIAG_CAT_V2G) == CBCTL_OK);
+    for (int i = 0; i < 40; i++) { round_trip(&link, &lb, &now, 100u); }
+    CHECK(lb.diag_categories == CBCTL_DIAG_CAT_V2G);
+
+    /* The board reboots: uptime goes backwards and its settings return to the default. */
+    lb.diag_categories = 0u;
+    lb.up_ms = 1u;
+    cbctl_link_reestablish(&link);
+    for (int i = 0; i < 60; i++) { round_trip(&link, &lb, &now, 100u); }
+    CHECK(lb.diag_categories == CBCTL_DIAG_CAT_V2G);
+}
+
+/* Silence and loss must never look the same. */
+TEST(a_dropped_ring_is_reported_not_hidden)
+{
+    cbctl_link_t link;
+    cbctl_loopback_t lb;
+    uint32_t now = 1000u;
+    uint32_t dropped = 0u;
+
+    bring_up(&link, &lb, &now);
+    lb.diag_control = true;
+    lb.diag_dropped = 4242u;
+    CHECK(cbctl_diag_enable(&link, true, test_sink, NULL) == CBCTL_OK);
+    CHECK(cbctl_diag_set_level(&link, CBCTL_DIAG_INFO) == CBCTL_OK);
+    for (int i = 0; i < 40; i++) { round_trip(&link, &lb, &now, 100u); }
+
+    CHECK(cbctl_diag_state(&link, NULL, NULL, &dropped, NULL));
+    CHECK(dropped == 4242u);
+}
+
+/* Clearing gives an armed trace an empty ring to start from, so one session's log cannot be
+ * prefixed with the tail of the previous vehicle's. */
+TEST(clearing_discards_the_previous_sessions_tail)
+{
+    cbctl_link_t link;
+    cbctl_loopback_t lb;
+    uint32_t now = 1000u;
+
+    g_sink_len = 0u; g_sink_calls = 0u;
+    bring_up(&link, &lb, &now);
+    seed_log(&lb, "[1] I previous vehicle\n");
+    lb.diag_control = true;
+
+    CHECK(cbctl_diag_clear(&link) == CBCTL_OK);
+    CHECK(cbctl_diag_enable(&link, true, test_sink, NULL) == CBCTL_OK);
+    for (int i = 0; i < 60; i++) { round_trip(&link, &lb, &now, 100u); }
+    CHECK(lb.diag_clear_seen == 1u);
+    CHECK(g_sink_len == 0u);
+}
+
 int main(void)
 {
     printf("link\n");
@@ -981,6 +1295,17 @@ int main(void)
     RUN(an_unopinionated_controller_never_denies);
     RUN(feedback_reports_the_contactor_the_board_reports);
     RUN(a_standing_relay_refusal_backs_off);
+    RUN(diagnostics_are_silent_until_enabled);
+    RUN(arming_without_a_sink_is_refused);
+    RUN(an_armed_drain_reaches_the_sink_verbatim);
+    RUN(no_drain_competes_with_a_live_charge);
+    RUN(an_empty_board_backs_off_and_a_backlog_speeds_up);
+    RUN(the_level_and_categories_are_confirmed_by_the_board);
+    RUN(an_old_firmware_that_drains_control_requests_is_handled);
+    RUN(a_swallowed_diag_reply_does_not_wedge_the_drain);
+    RUN(a_board_reset_re_arms_the_trace);
+    RUN(a_dropped_ring_is_reported_not_hidden);
+    RUN(clearing_discards_the_previous_sessions_tail);
     if (g_fail) {
         printf("FAIL link (%d)\n", g_fail);
         return 1;

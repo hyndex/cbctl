@@ -1,5 +1,8 @@
 #include "loopback.h"
 
+#include "cbctl/cbctl.h"
+#include "cbplc/diag.h"
+
 #include "cbplc/limits.h"
 
 #include <string.h>
@@ -198,6 +201,65 @@ static void plc_on_message(void *user, const cbplc_msg_t *msg, cbplc_err_t statu
         lb->auth_seen++;
         break;
     case CBPLC_T_HEARTBEAT: lb->heartbeat_seen++; break;
+
+    case CBPLC_T_DIAG: {
+        cbplc_diag_cmd_t cmd = CBPLC_DIAG_DRAIN;
+        uint32_t arg = 0u;
+        const cbplc_err_t drc = cbplc_diag_decode_request(msg->payload, msg->payload_len,
+                                                          &cmd, &arg);
+        uint8_t reply[CBPLC_DIAG_REPLY_SIZE];
+        cbplc_diag_state_t st;
+        size_t rn;
+
+        /* AN OLDER FIRMWARE DRAINS WHATEVER IT IS ASKED. This is the whole compatibility story
+         * and it is modelled rather than assumed: with diag_control false, a control request
+         * comes back as log text, which is exactly what cbctl must be able to survive. */
+        if (!lb->diag_control) {
+            cmd = CBPLC_DIAG_DRAIN;
+        } else if (drc != CBPLC_E_OK) {
+            /* Refused: change nothing, drain nothing, and say why. */
+            st.status = (uint8_t)drc;
+            st.level = lb->diag_level;
+            st.categories = lb->diag_categories;
+            st.dropped = lb->diag_dropped;
+            st.pending = lb->diag_len - lb->diag_taken;
+            rn = cbplc_diag_encode_reply(&st, reply, sizeof reply);
+            (void)cbplc_respond(&lb->plc, CBPLC_T_DIAG, msg->request_id, reply, (uint16_t)rn);
+            return;
+        }
+        lb->diag_last_cmd = (uint8_t)cmd;
+
+        if (cmd == CBPLC_DIAG_DRAIN) {
+            uint32_t avail = lb->diag_len - lb->diag_taken;
+            if (avail > CBCTL_DIAG_CHUNK_FULL) {
+                avail = CBCTL_DIAG_CHUNK_FULL;   /* the board's per-reply cap */
+            }
+            lb->diag_drains_seen++;
+            (void)cbplc_respond(&lb->plc, CBPLC_T_DIAG, msg->request_id,
+                                &lb->diag_text[lb->diag_taken], (uint16_t)avail);
+            lb->diag_taken += avail;
+            return;
+        }
+
+        lb->diag_ctl_seen++;
+        switch (cmd) {
+        case CBPLC_DIAG_SET_LEVEL: lb->diag_level = (uint8_t)arg; break;
+        case CBPLC_DIAG_SET_CATS:  lb->diag_categories = arg; break;
+        case CBPLC_DIAG_CLEAR:
+            lb->diag_taken = lb->diag_len;
+            lb->diag_clear_seen++;
+            break;
+        default: break;   /* GET_STATE is the reply itself */
+        }
+        st.status = 0u;
+        st.level = lb->diag_level;
+        st.categories = lb->diag_categories;
+        st.dropped = lb->diag_dropped;
+        st.pending = lb->diag_len - lb->diag_taken;
+        rn = cbplc_diag_encode_reply(&st, reply, sizeof reply);
+        (void)cbplc_respond(&lb->plc, CBPLC_T_DIAG, msg->request_id, reply, (uint16_t)rn);
+        return;
+    }
     default: break;
     }
 

@@ -13,6 +13,7 @@
 #include <string.h>
 
 #include "cbplc/auth.h"
+#include "cbplc/diag.h"
 #include "cbplc/limits.h"
 
 void cbctl_status_apply(cbctl_link_t *link, const uint8_t *payload, size_t len,
@@ -97,6 +98,18 @@ static void on_message(void *user, const cbplc_msg_t *msg, cbplc_err_t status)
      * none arrived. Checking msg first swallowed every loss, so a board that answered
      * nothing was never quarantined and was retried forever. */
     if (status != CBPLC_E_OK) {
+        /* A LOST DIAG REPLY MUST NOT WEDGE DIAGNOSTICS FOREVER.
+         *
+         * diag_req_pending is what stops a second drain being issued while one is outstanding,
+         * and a request that times out never reaches the reply path that clears it. Without
+         * this line the flag latches on the first lost frame and the controller silently stops
+         * draining for the rest of its life — the exact shape of the "one outstanding request
+         * that never completes" bugs this project has already paid for elsewhere. A control
+         * subcommand that was lost is re-armed too, so an intent is not quietly abandoned. */
+        if (link->diag_req_pending) {
+            link->diag_req_pending = false;
+            link->diag_req_was_control = false;
+        }
         /* A relay ACK is the only proof the lease was actually extended. Re-stamp from it so
          * the renewal clock measures APPLIED renewals, not attempted ones. */
         if (link->relay_ack_pending) {
@@ -178,6 +191,75 @@ static void on_message(void *user, const cbplc_msg_t *msg, cbplc_err_t status)
     case CBPLC_T_STATUS:
         cbctl_status_apply(link, msg->payload, msg->payload_len, link->session.last_now_ms);
         break;
+
+    case CBPLC_T_DIAG: {
+        /* ONE REPLY TYPE, TWO MEANINGS, DISAMBIGUATED BY THE PAYLOAD ITSELF.
+         *
+         * A control reply begins with a NUL and carries a magic byte, a version and an exact
+         * length. Drained log text is printf output, which contains no NUL, so the two cannot
+         * be confused — and that is what lets a controller talk to a board built before the
+         * subcommands existed. Such a board answers a control REQUEST by draining, so the reply
+         * arrives as text; seeing text where a control reply was expected is therefore not an
+         * error, it is the capability answer. */
+        cbplc_diag_state_t st;
+        const bool was_control = link->diag_req_was_control;
+        link->diag_req_pending = false;
+        link->diag_req_was_control = false;
+
+        if (cbplc_diag_decode_reply(msg->payload, msg->payload_len, &st)) {
+            link->diag_ctl_supported = true;
+            link->diag_state_valid = true;
+            link->last_diag_state = cbctl_instant(link->session.last_now_ms);
+            link->diag_board_level = st.level;
+            link->diag_board_cats = st.categories;
+            link->diag_dropped = st.dropped;
+            link->diag_pending = st.pending;
+            /* THE BOARD'S ANSWER IS THE TRUTH, NOT OUR REQUEST. A setter whose value was
+             * clamped or refused leaves the intent dirty so the tick re-asserts it; without
+             * this, a caller would believe a level the board never adopted. */
+            if (st.level == link->diag_want_level) {
+                link->diag_level_dirty = false;
+            }
+            if (st.categories == link->diag_want_cats) {
+                link->diag_cats_dirty = false;
+            }
+            /* A backlog on the board is a reason to hurry, and the only one we get. */
+            if (st.pending > 0u) {
+                link->diag_period_ms = CBCTL_DIAG_PERIOD_MIN_MS;
+            }
+            break;
+        }
+
+        if (was_control) {
+            /* Text where a control reply was expected: an older firmware. Record the verdict
+             * once and stop asking — but KEEP the bytes, because they are real log content that
+             * this board drained on our behalf, and discarding them would silently lose the
+             * only diagnostics such a board can give. */
+            link->diag_ctl_supported = false;
+            link->diag_level_dirty = false;
+            link->diag_cats_dirty = false;
+        }
+        if (msg->payload_len > 0u) {
+            link->diag_bytes += msg->payload_len;
+            /* CONTENT MEANS KEEP LISTENING. Any non-empty reply collapses the interval to the
+             * floor: the board caps one drain at CBCTL_DIAG_CHUNK_FULL, so a session's worth of
+             * trace is several replies, and backing off between them would stretch a 4 KB log
+             * over half a minute. Only silence backs off. */
+            link->diag_period_ms = CBCTL_DIAG_PERIOD_MIN_MS;
+            if (link->diag_sink != NULL) {
+                link->diag_sink(msg->payload, msg->payload_len, link->diag_user);
+            }
+        } else if (!was_control) {
+            /* Nothing new. Back off geometrically so a quiet board costs almost nothing —
+             * without this, a controller would spend a round trip a second on "no" forever. */
+            uint32_t next = link->diag_period_ms * 2u;
+            if (next > CBCTL_DIAG_PERIOD_MAX_MS || next < link->diag_period_ms) {
+                next = CBCTL_DIAG_PERIOD_MAX_MS;
+            }
+            link->diag_period_ms = next;
+        }
+        break;
+    }
 
     case CBPLC_T_ACK:
         /* The board answered the outstanding op. Payload byte 0 is the result code: zero is
@@ -318,6 +400,21 @@ void cbctl_link_reestablish(cbctl_link_t *link)
     link->envelope_dirty = true;
     link->measurement_dirty = true;
     link->auth_dirty = true;
+    /* cbplc deliberately does NOT persist its log level or category mask across a reboot — a
+     * charger silently retaining a debug firehose through a power cycle is how a diagnostic
+     * becomes an incident. That makes re-asserting them our job, and it is the same once-only
+     * class of state as the stop latch: a controller that armed a V2G trace, whose board then
+     * reset, would otherwise sit believing the trace was running against a board recording
+     * nothing, and would draw conclusions from the silence. */
+    if (link->diag_ctl_supported || !link->diag_ctl_probed) {
+        link->diag_level_dirty = true;
+        link->diag_cats_dirty = true;
+        link->diag_probe_dirty = link->diag_on;
+        link->diag_ctl_tries = 0u;
+    }
+    link->diag_state_valid = false;
+    link->diag_req_pending = false;
+    link->diag_req_was_control = false;
     link->relay_dirty = true;
     link->reidentify_pending = true;
     link->reestablishes++;
@@ -631,6 +728,30 @@ static uint32_t auth_period(const cbctl_link_t *link)
  * future field added to the envelope fails the build instead of smashing the stack. */
 _Static_assert(CBPLC_LIMITS_PAYLOAD_LEN <= 64u, "issue_one buffer too small for LIMITS");
 
+/* MAY WE SPEND A ROUND TRIP ON LOG TEXT RIGHT NOW?
+ *
+ * No, while energy is live. cbplc allows ONE outstanding request, so a drain in flight is
+ * ~620 ms of worst-case wire against a 1500 ms feed bound and a lease renewing at hold/6 — and
+ * it buys nothing, because a charge that is DELIVERING is not the one anybody needs a trace of.
+ * The sessions worth reading are the ones that failed, and by then the vehicle has stopped
+ * talking and there is no contention left to lose.
+ *
+ * "Live" is deliberately the union of two independent signals rather than either alone. A close
+ * intent means we are holding a contactor, which is the safety-critical state regardless of what
+ * the board reports; a board-reported active session covers the window before our intent exists
+ * and after it is dropped. Erring toward suppression is free — the ring is 16 KB and holds the
+ * whole session, so anything suppressed here is drained a moment later, intact.
+ *
+ * Suppressions are COUNTED. A trace that is quiet because the tool declined to ask looks exactly
+ * like a board that had nothing to say, and those must not be confusable. */
+static bool diag_drain_allowed(const cbctl_link_t *link)
+{
+    if ((link->relay_state & CBPLC_RELAY_ALL) != 0u) {
+        return false;
+    }
+    return !cbctl_flag(link, CBCTL_FLAG_SESSION_ACTIVE);
+}
+
 static bool issue_one(cbctl_link_t *link, cbctl_instant_t now)
 {
     uint8_t buf[64];
@@ -874,6 +995,104 @@ static bool issue_one(cbctl_link_t *link, cbctl_instant_t now)
             return true;
         }
     }
+
+    /* ---- DIAGNOSTICS: LAST, ALWAYS, AND HAPPY TO BE STARVED --------------------------------
+     *
+     * Everything above this line either holds permission to energise, holds a contactor, or is
+     * the controller's only view of the board. This does none of those things, so it goes after
+     * all of them and it does NOT age its way forward the way STATUS does.
+     *
+     * That asymmetry is the whole design. STATUS was given the right to jump the queue because a
+     * controller going blind mid-charge is dangerous. DIAG is the opposite case: on a
+     * stop-and-wait wire one request is a full round trip, and spending that on log text during
+     * a charge that is working costs feed and lease headroom for no benefit at all. Under load
+     * the messages above will consume the tick's poll budget and this will simply not run —
+     * which is the correct outcome, not a bug to fix later with an aging counter.
+     *
+     * A control subcommand outranks a drain, because a controller waiting for its trace to
+     * actually turn on should not queue behind kilobytes of the log it does not want yet. */
+    {
+    /* An INTENT is bounded by the try budget — arguing with a board that keeps answering
+     * something else is pointless. A periodic state READ is not an intent and must not be
+     * governed by that budget: it is the only thing that keeps `dropped` and `pending` from
+     * going stale, and staleness there is what makes a drained log look complete when it is
+     * not. */
+    const bool ctl_intent = (link->diag_clear_dirty || link->diag_level_dirty ||
+                             link->diag_cats_dirty || link->diag_probe_dirty) &&
+                            link->diag_ctl_tries < CBCTL_DIAG_CTL_TRIES;
+    const bool state_due = link->diag_on && link->diag_ctl_supported &&
+                           due(now, link->last_diag_state, CBCTL_DIAG_STATE_PERIOD_MS);
+    if (!link->diag_req_pending && (ctl_intent || state_due)) {
+        /* Derived at SEND time from the intent, never queued as a command. A queue can hold a
+         * value the caller has since changed its mind about; the intent cannot. Order matters:
+         * CLEAR first so an armed trace starts from an empty ring rather than the tail of the
+         * previous vehicle's session, then the level, then the categories. */
+        cbplc_diag_cmd_t cmd;
+        uint32_t arg;
+        if (link->diag_clear_dirty) {
+            cmd = CBPLC_DIAG_CLEAR;
+            arg = 0u;
+        } else if (link->diag_level_dirty) {
+            cmd = CBPLC_DIAG_SET_LEVEL;
+            arg = link->diag_want_level;
+        } else if (link->diag_cats_dirty) {
+            cmd = CBPLC_DIAG_SET_CATS;
+            arg = link->diag_want_cats;
+        } else {
+            cmd = CBPLC_DIAG_GET_STATE;   /* the probe, and the periodic refresh */
+            arg = 0u;
+        }
+        n = cbplc_diag_encode_request(cmd, arg, buf, sizeof buf);
+        if (n > 0u && cbplc_request(&link->session, CBPLC_T_DIAG, buf, (uint16_t)n, now.ms,
+                                    &id) == CBPLC_E_OK) {
+            link->diag_req_pending = true;
+            link->diag_req_was_control = true;
+            link->diag_ctl_probed = true;
+            /* Only an INTENT spends the budget. The periodic refresh must be able to run
+             * forever without exhausting the thing that bounds re-assertion. */
+            if (ctl_intent) {
+                link->diag_ctl_tries++;
+            }
+            /* CLEAR has no readback to confirm it — the reply reports pending==0, which is also
+             * what an already-empty ring reports — so it is retired on transmission. The level
+             * and categories are NOT: they are confirmed against what the board sends back. */
+            if (cmd == CBPLC_DIAG_CLEAR) {
+                link->diag_clear_dirty = false;
+            }
+            /* The probe is answered either way — a control reply proves support, log text
+             * proves the opposite — so it is retired on transmission and never repeats. */
+            if (cmd == CBPLC_DIAG_GET_STATE) {
+                link->diag_probe_dirty = false;
+            }
+            return true;
+        }
+        return false;
+    }
+    }
+
+    if (link->diag_on && !link->diag_req_pending &&
+        due(now, link->last_diag, link->diag_period_ms)) {
+        if (!diag_drain_allowed(link)) {
+            /* Counted, and the cadence clock is STAMPED so a suppressed pass does not leave a
+             * drain permanently "due" — otherwise every tick of a long charge would re-evaluate
+             * this branch and fall through, and the moment the session ended a burst of drains
+             * would be owed all at once. */
+            link->last_diag = now;
+            link->diag_suppressed++;
+            return false;
+        }
+        /* An EMPTY payload, not an explicit DRAIN byte. Every firmware ever built answers this
+         * by draining, so the read path works against a board that has never heard of the
+         * subcommands — and detecting that is what the control probe is for, separately. */
+        if (cbplc_request(&link->session, CBPLC_T_DIAG, NULL, 0u, now.ms, &id) == CBPLC_E_OK) {
+            link->last_diag = now;
+            link->diag_req_pending = true;
+            link->diag_req_was_control = false;
+            link->diag_drains++;
+            return true;
+        }
+        return false;
+    }
     return false;
 }
 
@@ -1061,4 +1280,99 @@ uint32_t cbctl_next_deadline_ms(const cbctl_link_t *link, uint32_t now_ms)
     }
     best = CBCTL_FEED_PERIOD_MS - age;
     return best;
+}
+
+/* ---- board diagnostics --------------------------------------------------------------------
+ *
+ * Every function here is an INTENT, like the rest of the library: nothing waits, nothing blocks,
+ * and cbctl_tick() is what touches the wire. See the header for why diagnostics are the one
+ * message class deliberately allowed to starve.
+ */
+cbctl_status_t cbctl_diag_enable(cbctl_link_t *link, bool on, cbctl_diag_sink_fn sink,
+                                 void *user)
+{
+    if (link == NULL || link->magic != CBCTL_LINK_MAGIC) {
+        return CBCTL_E_ARG;
+    }
+    /* A SINK IS REQUIRED TO ARM. Draining is DESTRUCTIVE — the board's ring hands the bytes over
+     * and forgets them — so enabling without somewhere to put them would quietly consume the
+     * evidence it was turned on to collect. Refusing here makes that impossible to write. */
+    if (on && sink == NULL) {
+        return CBCTL_E_ARG;
+    }
+    link->diag_sink = sink;
+    link->diag_user = user;
+    if (on && !link->diag_on) {
+        /* Start at the floor so an armed trace is picked up promptly, and let the backoff find
+         * the quiet rate by itself. */
+        link->diag_period_ms = CBCTL_DIAG_PERIOD_MIN_MS;
+        link->last_diag = cbctl_instant(0u);
+        link->diag_probe_dirty = true;
+        link->diag_ctl_tries = 0u;
+    }
+    link->diag_on = on;
+    return CBCTL_OK;
+}
+
+cbctl_status_t cbctl_diag_set_level(cbctl_link_t *link, cbctl_diag_level_t level)
+{
+    if (link == NULL || link->magic != CBCTL_LINK_MAGIC) {
+        return CBCTL_E_ARG;
+    }
+    if ((uint32_t)level > (uint32_t)CBCTL_DIAG_OFF) {
+        return CBCTL_E_ARG;
+    }
+    /* Only an ACTUAL change re-arms the try budget. Re-stating a level that is already in force
+     * must be free, because a caller may legitimately assert its policy every pass — the same
+     * lesson the feed learned when re-declaring it every tick starved every other message. */
+    if (link->diag_want_level != (uint8_t)level || !link->diag_state_valid) {
+        link->diag_want_level = (uint8_t)level;
+        link->diag_level_dirty = true;
+        link->diag_ctl_tries = 0u;
+    }
+    return CBCTL_OK;
+}
+
+cbctl_status_t cbctl_diag_set_categories(cbctl_link_t *link, uint32_t mask)
+{
+    if (link == NULL || link->magic != CBCTL_LINK_MAGIC) {
+        return CBCTL_E_ARG;
+    }
+    if (link->diag_want_cats != mask || !link->diag_state_valid) {
+        link->diag_want_cats = mask;
+        link->diag_cats_dirty = true;
+        link->diag_ctl_tries = 0u;
+    }
+    return CBCTL_OK;
+}
+
+cbctl_status_t cbctl_diag_clear(cbctl_link_t *link)
+{
+    if (link == NULL || link->magic != CBCTL_LINK_MAGIC) {
+        return CBCTL_E_ARG;
+    }
+    link->diag_clear_dirty = true;
+    link->diag_ctl_tries = 0u;
+    return CBCTL_OK;
+}
+
+bool cbctl_diag_state(const cbctl_link_t *link, uint8_t *level, uint32_t *categories,
+                      uint32_t *dropped, uint32_t *pending)
+{
+    if (link == NULL || link->magic != CBCTL_LINK_MAGIC || !link->diag_state_valid) {
+        /* NOT zeros. "The board has never told us" and "the board reports nothing dropped" are
+         * different facts, and rendering the first as the second is how a controller concludes a
+         * trace is complete when it has never spoken to the ring at all. */
+        return false;
+    }
+    if (level != NULL) { *level = link->diag_board_level; }
+    if (categories != NULL) { *categories = link->diag_board_cats; }
+    if (dropped != NULL) { *dropped = link->diag_dropped; }
+    if (pending != NULL) { *pending = link->diag_pending; }
+    return true;
+}
+
+bool cbctl_diag_control_supported(const cbctl_link_t *link)
+{
+    return link != NULL && link->magic == CBCTL_LINK_MAGIC && link->diag_ctl_supported;
 }

@@ -81,6 +81,26 @@ typedef struct {
                            * stopped servicing ONE request while the rest of it is alive, which
                            * is what forces the stop-and-wait retry path */
 
+    /* --- the diagnostic log ring, modelled ---------------------------------------------
+     *
+     * `diag_text` is what the board would hand over on the next drain; the fake ring is a
+     * simple buffer rather than a real one because what is under test here is the CONTROLLER's
+     * behaviour — when it asks, how it backs off, and what it does with the answer.
+     *
+     * `diag_control` is the switch that matters most: with it FALSE the fake board behaves like
+     * a firmware built before subcommands existed and answers EVERY diag request, control ones
+     * included, by draining. That is the compatibility case, and it is only a test away from
+     * being wrong in the field. */
+    bool     diag_control;      /* false models an older firmware: control requests drain */
+    uint8_t  diag_level;
+    uint32_t diag_categories;
+    uint32_t diag_dropped;
+    uint8_t  diag_text[4096];
+    uint32_t diag_len;          /* bytes currently buffered */
+    uint32_t diag_taken;        /* read cursor into diag_text */
+    unsigned diag_drains_seen, diag_ctl_seen, diag_clear_seen;
+    uint8_t  diag_last_cmd;
+
     /* Observability for assertions. */
     unsigned ctrl_frames_in, plc_frames_in;
     unsigned identify_seen, limits_seen, feedback_seen, auth_seen, heartbeat_seen;

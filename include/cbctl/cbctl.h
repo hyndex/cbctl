@@ -134,6 +134,37 @@ extern "C" {
 #define CBCTL_RELAY_REFUSAL_FAST_RETRIES 2u
 #endif
 
+/* DIAG drain cadence. The floor is how fast a backlog is cleared; the ceiling is what a quiet
+ * board costs. Geometric backoff between them means an idle link settles at one round trip
+ * every eight seconds while a board with a session's worth of trace to hand over drains at the
+ * floor until it is empty. */
+#ifndef CBCTL_DIAG_PERIOD_MIN_MS
+#define CBCTL_DIAG_PERIOD_MIN_MS 250u
+#endif
+#ifndef CBCTL_DIAG_PERIOD_MAX_MS
+#define CBCTL_DIAG_PERIOD_MAX_MS 8000u
+#endif
+/* cbplc caps one drain reply at 1024 bytes, so a reply THIS big proves there is more waiting —
+ * the only backlog signal available from a firmware too old to report `pending`. */
+#define CBCTL_DIAG_CHUNK_FULL 1024u
+/* How many times one control intent may be re-asserted before cbctl stops spending round trips
+ * on it. Three covers a lost frame or two; beyond that the board is answering something we did
+ * not ask for and repeating will not change its mind. */
+#ifndef CBCTL_DIAG_CTL_TRIES
+#define CBCTL_DIAG_CTL_TRIES 3u
+#endif
+/* How often the board's ring state is re-read while diagnostics are armed.
+ *
+ * `dropped` and `pending` only ever arrive in a control reply, so without a refresh they are
+ * frozen at whatever they were when the last setter was answered. Observed on hardware: after
+ * draining 520 bytes the tool still reported "pending=520", because nothing had asked again —
+ * a stale number presented as a live one, which is the exact failure mode this library treats
+ * as a defect everywhere else. Three seconds is far cheaper than the drain it accompanies, and
+ * it is suppressed during a charge like every other diagnostic request. */
+#ifndef CBCTL_DIAG_STATE_PERIOD_MS
+#define CBCTL_DIAG_STATE_PERIOD_MS 3000u
+#endif
+
 /* Consecutive lost requests before a link is quarantined. */
 /* A controller driving more than this many PLCs is unusual; raise it freely. */
 #ifndef CBCTL_FLEET_MAX
@@ -254,6 +285,35 @@ typedef enum {
     CBCTL_CTR__COUNT
 } cbctl_counter_t;
 
+/* Minimum level the BOARD should record. Mirrors cbplc's wire values; OFF records nothing. */
+typedef enum {
+    CBCTL_DIAG_DEBUG = 0,
+    CBCTL_DIAG_INFO = 1,
+    CBCTL_DIAG_WARN = 2,
+    CBCTL_DIAG_ERROR = 3,
+    CBCTL_DIAG_OFF = 4,
+} cbctl_diag_level_t;
+
+/* Category bits, mirroring cbplc's. V2G is the per-message decoded HLC trace and is the reason
+ * categories exist at all: it is INFO-level and enormous, so it must be separable from the
+ * INFO lines that are rare and always wanted. */
+#define CBCTL_DIAG_CAT_CORE  0x00000001u
+#define CBCTL_DIAG_CAT_V2G   0x00000002u
+#define CBCTL_DIAG_CAT_SLAC  0x00000004u
+#define CBCTL_DIAG_CAT_CP    0x00000008u
+#define CBCTL_DIAG_CAT_RELAY 0x00000010u
+
+/* Where drained text goes. Called from inside cbctl_tick(), with the bytes exactly as the board
+ * produced them — never NUL-terminated, because the ring holds a byte stream and a chunk
+ * boundary can fall mid-line. A sink that wants whole lines must buffer; cbctl deliberately does
+ * not, since a controller writing to a file wants the bytes and one that parses wants to choose
+ * its own framing.
+ *
+ * MUST NOT BLOCK. It runs on the control loop, and this project has already lost a fleet's
+ * PreCharge to a synchronous read on that thread. Append to memory or write to an fd opened
+ * non-blocking; do not fsync, and do not call back into cbctl. */
+typedef void (*cbctl_diag_sink_fn)(const uint8_t *bytes, uint16_t len, void *user);
+
 typedef enum {
     CBCTL_EV_NONE = 0,
     CBCTL_EV_VEHICLE_PLUGGED,
@@ -341,6 +401,48 @@ typedef struct {
     uint32_t relay_hold_ms;
     cbctl_instant_t last_relay;
     bool     relay_dirty;   /* a change the tick has not yet put on the wire */
+
+    /* Board diagnostics. Everything here is inert until cbctl_diag_enable(). */
+    cbctl_diag_sink_fn diag_sink;
+    void              *diag_user;
+    bool     diag_on;
+    bool     diag_ctl_supported;  /* the board has answered a control request as a control reply */
+    bool     diag_ctl_probed;     /* we have asked at least once, so "false" above is a verdict */
+    bool     diag_state_valid;    /* the board has reported its ring state at least once */
+    uint8_t  diag_want_level;     /* what we intend the board to record */
+    uint32_t diag_want_cats;
+    /* DIRTY UNTIL THE BOARD CONFIRMS IT, not until we transmit it. A setter whose value the
+     * board clamped or ignored must keep being re-asserted, and the only evidence of what is
+     * actually in force is the state the board sends back. Same rule the envelope follows. */
+    bool     diag_level_dirty, diag_cats_dirty, diag_clear_dirty;
+    /* Arming sends one GET_STATE. Without it a controller that only wants to READ the log
+     * would never learn whether control is supported, nor the board's drop count — and the
+     * drop count is what separates "nothing was logged" from "we lost it". */
+    bool     diag_probe_dirty;
+    /* Bounded re-assertion. If a board keeps reporting something other than what was asked —
+     * a firmware that clamps differently, a value we cannot express — re-sending forever would
+     * spend a round trip per attempt for the life of the controller. Give up, leave the intent
+     * visible in diag_want_*, and let a board reset re-arm it. */
+    uint8_t  diag_ctl_tries;
+    uint8_t  diag_board_level;    /* what the board last SAID it is recording */
+    uint32_t diag_board_cats;
+    uint32_t diag_dropped;        /* board's own count of bytes it overwrote — silence vs loss */
+    uint32_t diag_pending;
+    cbctl_instant_t last_diag;
+    cbctl_instant_t last_diag_state;  /* when the board last reported its ring */
+    /* ADAPTIVE BACKOFF, so an idle board costs almost nothing and a backlog clears fast. An
+     * empty drain doubles the interval up to a ceiling; a non-empty one collapses it to the
+     * floor. Without this, polling a quiet board at the fast rate would spend a round trip a
+     * second on "nothing new" for the entire life of the controller. */
+    uint32_t diag_period_ms;
+    /* Which kind of reply the outstanding DIAG request expects. A drain reply is bytes; a
+     * control reply is a state struct; and on an old firmware a control REQUEST comes back as
+     * bytes — which is exactly how support is detected. */
+    bool     diag_req_was_control;
+    bool     diag_req_pending;
+    uint32_t diag_drains;         /* observability: what actually reached the wire */
+    uint32_t diag_bytes;
+    uint32_t diag_suppressed;     /* drains skipped because energy was live */
 
     /* SEND ACCOUNTING. Without these a message that never reaches the wire is invisible:
      * the board starves, the controller reports a healthy link, and nothing names the gap.
@@ -652,6 +754,67 @@ uint32_t cbctl_observation_age_ms(const cbctl_link_t *link, uint32_t now_ms);
  *
  * Returns 0 when no lease is held. */
 uint32_t cbctl_lease_headroom_ms(const cbctl_link_t *link, uint32_t now_ms);
+
+/* ---- board diagnostics: the log ring --------------------------------------------------------
+ *
+ * cbplc keeps every line of its diagnostic text in a RAM ring rather than printing it, because
+ * the control wire carries framed binary and one text line mid-stream reads as a garbage length
+ * prefix. CBPLC_T_DIAG drains that ring, and (on firmware that supports the subcommands) sets
+ * what goes into it — including the per-message decoded V2G trace, which is the thing worth
+ * having when a particular vehicle refuses a particular charger.
+ *
+ * DIAGNOSTICS ARE THE ONE MESSAGE THAT IS ALLOWED TO STARVE, and that is a deliberate inversion.
+ *
+ *   STATUS earned its aging and its queue-jump because a controller that goes blind mid-charge
+ *   is dangerous — measured: limits=60, feedback=60, heartbeat=33, relay=20, STATUS=1 across
+ *   24 s, until it was given the right to age past CBCTL_STATUS_STARVE_MS. The note on that fix
+ *   says not to add another low-priority message without the same treatment.
+ *
+ *   DIAG is the case where that warning does not apply, and applying it would be actively wrong.
+ *   cbplc is stop-and-wait: one outstanding request, and a request occupies the wire for a full
+ *   round trip. Spending that on log text during a charge that is WORKING buys nothing and
+ *   costs feed and lease headroom. So DIAG is issued strictly last, never ages, never jumps the
+ *   queue, and is suppressed outright while energy is live. Logs matter for the sessions that
+ *   FAILED, and a vehicle that has refused you has already stopped talking — there is no
+ *   contention left to lose by then.
+ *
+ * All of this is OFF by default. A controller that never calls cbctl_diag_enable() behaves
+ * exactly as one built before this existed. */
+
+/* Arm or disarm draining. Disarming does NOT change what the board records — a controller that
+ * stops listening should not silently reconfigure a board another tool may be watching. Use
+ * cbctl_diag_set_level(CBCTL_DIAG_OFF) for that, explicitly. */
+cbctl_status_t cbctl_diag_enable(cbctl_link_t *link, bool on, cbctl_diag_sink_fn sink,
+                                 void *user);
+
+/* Ask the board to record at this level / these categories. Intents, like every other setter
+ * here: they are transmitted by the tick and re-asserted after a board reset, because cbplc
+ * deliberately does not persist them across a reboot (a charger silently retaining a debug
+ * firehose through a power cycle is how a diagnostic becomes an incident). */
+cbctl_status_t cbctl_diag_set_level(cbctl_link_t *link, cbctl_diag_level_t level);
+cbctl_status_t cbctl_diag_set_categories(cbctl_link_t *link, uint32_t mask);
+
+/* Discard whatever the board has buffered. Used to get a clean slate before arming a trace, so
+ * one session's log cannot be prefixed with the tail of the last one. */
+cbctl_status_t cbctl_diag_clear(cbctl_link_t *link);
+
+/* What the board last reported about its own ring.
+ *
+ * `dropped` is the field that matters: it counts bytes the ring overwrote because nobody drained
+ * fast enough, and it is what separates "the board said nothing" from "the board said something
+ * and we lost it". A trace whose drop count is climbing is not evidence, and a controller that
+ * cannot tell will quietly draw conclusions from a log with holes in it.
+ *
+ * Returns false before the board has ever answered a control request — never zeros, for the same
+ * reason cbctl_ev_soc_pct() returns -1 rather than 0. */
+bool cbctl_diag_state(const cbctl_link_t *link, uint8_t *level, uint32_t *categories,
+                      uint32_t *dropped, uint32_t *pending);
+
+/* True once the board has proved it understands the control subcommands. False either because
+ * nothing has been asked yet, or because this is an older firmware that answers a control
+ * request by draining — in which case draining still works and only the level/category setters
+ * are inert. Checking this is how a caller tells "logging is off" from "I cannot turn it on". */
+bool cbctl_diag_control_supported(const cbctl_link_t *link);
 
 #ifdef __cplusplus
 }

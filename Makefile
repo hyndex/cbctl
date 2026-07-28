@@ -31,7 +31,7 @@ TESTS   := $(patsubst tests/test_%.c,$(BUILD)/test_%,$(TESTSRC))
 
 OBJ     := $(patsubst %.c,$(BUILD)/obj/%.o,$(VENDOR) $(SRC))
 
-.PHONY: all check test clean vendor live live-dual budget deadman charge example
+.PHONY: all check test clean vendor live live-dual budget deadman charge example selftest boardlog
 # Objects are NOT intermediates. Without this make deletes them after linking, which throws
 # away their .d files, and the next build silently skips a rebuild after a HEADER change —
 # a stale binary that passes is worse than a broken one that fails.
@@ -97,6 +97,13 @@ $(BUILD)/charge_soc: tools/charge_soc.c $(POWSRC) $(OBJ)
 	@mkdir -p $(BUILD)/pow && mv -f *.o $(BUILD)/pow/ 2>/dev/null || true
 	$(CC) $(CFLAGS) -c $< -o $(BUILD)/charge_soc.o
 	$(CXX) $(BUILD)/charge_soc.o $(OBJ) $(BUILD)/pow/*.o -o $@
+
+# The operator-facing way to read a board's log and arm its V2G trace. Pure controller code, so
+# it links against $(OBJ) alone — it never touches CAN or the meter.
+boardlog: $(BUILD)/board_log
+$(BUILD)/board_log: tools/board_log.c $(OBJ)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) $< $(OBJ) -o $@
 
 budget: $(BUILD)/tick_budget
 $(BUILD)/tick_budget: tools/tick_budget.c $(OBJ)
