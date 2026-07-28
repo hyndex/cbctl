@@ -1,0 +1,19 @@
+# Build output. `build/` is the host tree and `build-<arch>/` the cross-built ones; both are
+# reproducible from source and one of them holds objects for a different architecture, which is
+# exactly the thing that must never travel in a commit.
+build/
+build-*/
+
+# Object files left in the tree by the two-step C++ link in the `charge` / `selftest` targets.
+*.o
+*.d
+
+# Deployment tarballs staged for scp to a charger. Artefacts, not sources.
+*.tar
+*.tar.gz
+*.tgz
+
+# macOS resource forks. They appear on any tree that has been copied over AFP/SMB and they
+# arrive on the Pi as ._foo files that shadow the real ones in a glob.
+.DS_Store
+._*
