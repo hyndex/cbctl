@@ -195,8 +195,12 @@ void cbctl_status_apply(cbctl_link_t *link, const uint8_t *payload, size_t len, 
 
     /* TRUNCATION DETECTION — AND IT MUST COME FIRST.
      *
-     * The board's STATUS is one big formatted line with a payload cap, and `b1_dwell` is the
-     * LAST key in that format string — so its presence proves the whole line arrived. Without
+     * The board's STATUS is one big formatted line with a payload cap, and CBCTL_STATUS_TAIL_KEY
+     * is the LAST key in that format string — so its presence proves the whole line arrived.
+     * IT MOVES WHENEVER build_status() GAINS A FIELD: a sentinel that is no longer last stops
+     * detecting truncation silently, which is the exact failure it exists to catch. Named as a
+     * constant, next to cbplc's own TAIL_KEY in tools/probe.py, so the two are findable
+     * together. Without
      * this check a truncated reply is indistinguishable from a healthy one: the keys that fell
      * off simply read as absent, every flag derived from them silently reads false, and a
      * controller concludes "no vehicle, no session, no match" while a car is plugged in.
@@ -215,14 +219,14 @@ void cbctl_status_apply(cbctl_link_t *link, const uint8_t *payload, size_t len, 
      *
      * The board's overflow MARKER is a different animal and is handled first: when STATUS grows
      * past the payload cap, cbplc deliberately sends a short "status_overflow=N cp=… session=…"
-     * line instead of going quiet. It legitimately has no b1_dwell. Counting that as truncation
+     * line instead of going quiet. It legitimately has no tail key. Counting that as truncation
      * would throw away the one message whose entire purpose is to report the overflow. */
     if (u32_field(buf, len, "status_overflow", &v)) {
         link->counters[CBCTL_CTR_STATUS_OVERFLOWS] = v;
     }
     {
         size_t tl = 0u;
-        if (field(buf, len, "b1_dwell", &tl) == NULL) {
+        if (field(buf, len, CBCTL_STATUS_TAIL_KEY, &tl) == NULL) {
             link->counters[CBCTL_CTR_STATUS_TRUNCATED]++;
             return;
         }

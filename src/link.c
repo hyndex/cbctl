@@ -14,6 +14,7 @@
 
 #include "cbplc/auth.h"
 #include "cbplc/diag.h"
+#include "cbplc/provision.h"
 #include "cbplc/limits.h"
 
 void cbctl_status_apply(cbctl_link_t *link, const uint8_t *payload, size_t len,
@@ -110,6 +111,15 @@ static void on_message(void *user, const cbplc_msg_t *msg, cbplc_err_t status)
             link->diag_req_pending = false;
             link->diag_req_was_control = false;
         }
+        /* Same rule as the diag drain: an in-flight flag that a timeout never clears wedges the
+         * path for the life of the controller. The dirty intent survives, so the tick retries
+         * within its budget. */
+        if (link->prov_inflight) {
+            link->prov_inflight = false;
+        }
+        if (link->restart_inflight) {
+            link->restart_inflight = false;
+        }
         /* A relay ACK is the only proof the lease was actually extended. Re-stamp from it so
          * the renewal clock measures APPLIED renewals, not attempted ones. */
         if (link->relay_ack_pending) {
@@ -192,6 +202,19 @@ static void on_message(void *user, const cbplc_msg_t *msg, cbplc_err_t status)
         cbctl_status_apply(link, msg->payload, msg->payload_len, link->session.last_now_ms);
         break;
 
+    case CBPLC_T_RESTART:
+        /* The board answers a restart with its own type rather than an ACK, so the gate verdict
+         * is unambiguous: byte 0 is CBPLC_E_OK when it accepted and will reboot, or the reason
+         * it refused. A refusal is INFORMATION — the connector was not idle — not a transport
+         * failure, and must not be retried in a loop. */
+        link->restart_inflight = false;
+        if (link->op_state == CBCTL_OP_PENDING) {
+            link->op_gate = (msg->payload_len > 0u) ? msg->payload[0] : 0u;
+            link->op_state = (link->op_gate == 0u) ? CBCTL_OP_APPLIED : CBCTL_OP_REFUSED;
+            link->op_on_wire = false;
+        }
+        break;
+
     case CBPLC_T_DIAG: {
         /* ONE REPLY TYPE, TWO MEANINGS, DISAMBIGUATED BY THE PAYLOAD ITSELF.
          *
@@ -266,6 +289,31 @@ static void on_message(void *user, const cbplc_msg_t *msg, cbplc_err_t status)
          * applied, anything else is a REFUSAL that names its gate. A refusal is information,
          * not a transient failure — retrying it in a loop is how a controller argues with an
          * interlock forever. */
+        if (link->prov_inflight) {
+            const uint8_t rc = (msg->payload_len > 0u) ? msg->payload[0] : 0u;
+            link->prov_inflight = false;
+            if (rc == 0u) {
+                /* CLEARED ONLY ON THE BOARD'S OWN ACK, never on transmission. A declaration
+                 * that was sent and lost must be re-sent; believing it because it left is how a
+                 * charger ends up announcing an identity nobody applied. */
+                link->prov_dirty = false;
+                link->prov_supported = true;
+                link->prov_tries = 0u;
+                link->prov_accepted++;
+            } else if (rc == (uint8_t)CBPLC_E_BAD_TYPE) {
+                /* A firmware that predates provisioning. Stop asking — it is running its
+                 * compiled defaults and no amount of repeating changes that — but keep the
+                 * intent so a later board reset (or a reflash) re-asserts it. */
+                link->prov_supported = false;
+                link->prov_dirty = false;
+                link->prov_refused++;
+            } else {
+                /* The board understood and REFUSED: a value it considers invalid. Repeating it
+                 * cannot help, so the bounded try budget stops us arguing, and the intent stays
+                 * visible in link->prov for a caller to inspect. */
+                link->prov_refused++;
+            }
+        }
         /* A relay ACK is the only proof the lease was actually extended. Re-stamp from it so
          * the renewal clock measures APPLIED renewals, not attempted ones. */
         if (link->relay_ack_pending) {
@@ -415,6 +463,19 @@ void cbctl_link_reestablish(cbctl_link_t *link)
     link->diag_state_valid = false;
     link->diag_req_pending = false;
     link->diag_req_was_control = false;
+    /* PROVISIONING IS ONCE-ONLY STATE AND THE BOARD DOES NOT KEEP IT.
+     *
+     * cbplc holds a declaration in RAM only, so a reset returns it to compiled defaults — which
+     * for the EVSE ID means the fleet-wide fallback. A controller that did not re-assert would
+     * leave a charger quietly announcing the wrong identity for the rest of its uptime, with
+     * nothing anywhere saying so. Same class as the stop latch. */
+    if (link->prov.evse_id_set || link->prov.protocol_mask_set || link->prov.attn_trim_set ||
+        link->prov.session_timeout_set) {
+        link->prov_dirty = true;
+        link->prov_tries = 0u;
+    }
+    link->prov_inflight = false;
+    link->restart_inflight = false;
     link->relay_dirty = true;
     link->reidentify_pending = true;
     link->reestablishes++;
@@ -540,13 +601,31 @@ cbctl_op_state_t cbctl_op_state(const cbctl_link_t *link, cbctl_op_t op)
 
 /* ---- relay leases ------------------------------------------------------------------------ */
 
-static cbctl_op_t new_op(cbctl_link_t *link)
+/* AN OP BELONGS TO ONE MESSAGE TYPE, and recording which one is not bookkeeping.
+ *
+ * There is a single op slot, and several branches of issue_one() marked "the outstanding op is
+ * on the wire" whenever ANY pending op existed — not only when they were sending that op's own
+ * message. So a RELAY frame going out while a restart was queued set op_on_wire, and the relay's
+ * ACK resolved the RESTART op as applied, from a board that had never seen a restart request.
+ *
+ * This is the same defect the op_on_wire flag was introduced to fix, one level up: it stopped an
+ * unrelated message's completion resolving an op, and this stops an unrelated message's
+ * TRANSMISSION claiming one. Caught by a test, not on hardware. */
+static cbctl_op_t new_op(cbctl_link_t *link, uint8_t owner_type)
 {
     const cbctl_op_t op = { link->next_op_id++ };
     link->op = op;
     link->op_state = CBCTL_OP_PENDING;
     link->op_gate = 0u;
+    link->op_type = owner_type;
+    link->op_on_wire = false;
     return op;
+}
+
+/* Is the message about to go out the one the outstanding op is waiting for? */
+static bool op_owns(const cbctl_link_t *link, uint8_t type)
+{
+    return link->op_state == CBCTL_OP_PENDING && link->op_type == type;
 }
 
 cbctl_status_t cbctl_relay_close(cbctl_link_t *link, uint8_t mask, uint32_t hold_ms,
@@ -606,7 +685,7 @@ cbctl_status_t cbctl_relay_close(cbctl_link_t *link, uint8_t mask, uint32_t hold
     link->relay_safety_base = link->counters[CBCTL_CTR_RELAY_SAFETY_OPENS];
     link->relay_base_valid = link->have_flags;
     if (out_op != NULL) {
-        *out_op = new_op(link);
+        *out_op = new_op(link, (uint8_t)CBPLC_T_RELAY);
     }
     return CBCTL_OK;
 }
@@ -622,7 +701,7 @@ cbctl_status_t cbctl_relay_open(cbctl_link_t *link, uint8_t mask, cbctl_op_t *ou
     link->relay_state = (uint8_t)(link->relay_state & ~mask);
     link->relay_dirty = true;
     if (out_op != NULL) {
-        *out_op = new_op(link);
+        *out_op = new_op(link, (uint8_t)CBPLC_T_RELAY);
     }
     return CBCTL_OK;
 }
@@ -640,7 +719,7 @@ static cbctl_status_t slac_cmd(cbctl_link_t *link, uint8_t sub, cbctl_op_t *out_
     }
     link->slac_pending = (uint8_t)(sub + 1u);
     if (out_op != NULL) {
-        *out_op = new_op(link);
+        *out_op = new_op(link, (uint8_t)CBPLC_T_SLAC);
     }
     return CBCTL_OK;
 }
@@ -784,7 +863,7 @@ static bool issue_one(cbctl_link_t *link, cbctl_instant_t now)
         buf[0] = (uint8_t)(link->slac_pending - 1u);
         if (cbplc_request(&link->session, CBPLC_T_SLAC, buf, 1u, now.ms, &id) == CBPLC_E_OK) {
             link->slac_pending = 0u;
-            if (link->op_state == CBCTL_OP_PENDING) {
+            if (op_owns(link, (uint8_t)CBPLC_T_SLAC)) {
                 link->op_on_wire = true;
             }
             return true;
@@ -953,7 +1032,7 @@ static bool issue_one(cbctl_link_t *link, cbctl_instant_t now)
                 link->relay_ack_pending = true;
                 link->relay_renewals++;
             }
-            if (link->op_state == CBCTL_OP_PENDING) {
+            if (op_owns(link, (uint8_t)CBPLC_T_RELAY)) {
                 link->op_on_wire = true;
             }
             return true;
@@ -994,6 +1073,41 @@ static bool issue_one(cbctl_link_t *link, cbctl_instant_t now)
             link->status_sent++;
             return true;
         }
+    }
+
+    /* ---- PROVISIONING: rare, small, and above diagnostics ----------------------------------
+     *
+     * Below every operational message, because nothing here holds a contactor or permission to
+     * energise — but ABOVE the log drain, because a board running the wrong EVSE ID is
+     * announcing the wrong charger to a vehicle right now, while a log can wait.
+     *
+     * It is not periodic. A declaration goes out when it CHANGES and after a board reset, and
+     * then never again: re-sending an identity every second would be pure noise on a
+     * stop-and-wait wire. `prov_dirty` is cleared only when the board ACKs, so a lost frame
+     * retries rather than being silently believed. */
+    if (link->prov_dirty && !link->prov_inflight && link->prov_tries < CBCTL_PROV_TRIES) {
+        n = cbplc_provision_encode(&link->prov, buf, sizeof buf);
+        if (n > 0u && cbplc_request(&link->session, CBPLC_T_PROVISION, buf, (uint16_t)n,
+                                    now.ms, &id) == CBPLC_E_OK) {
+            link->prov_inflight = true;
+            link->prov_probed = true;
+            link->prov_tries++;
+            return true;
+        }
+        return false;
+    }
+
+    if (link->restart_pending && !link->restart_inflight) {
+        if (cbplc_request(&link->session, CBPLC_T_RESTART, NULL, 0u, now.ms, &id) ==
+            CBPLC_E_OK) {
+            link->restart_pending = false;
+            link->restart_inflight = true;
+            if (op_owns(link, (uint8_t)CBPLC_T_RESTART)) {
+                link->op_on_wire = true;
+            }
+            return true;
+        }
+        return false;
     }
 
     /* ---- DIAGNOSTICS: LAST, ALWAYS, AND HAPPY TO BE STARVED --------------------------------
@@ -1375,4 +1489,120 @@ bool cbctl_diag_state(const cbctl_link_t *link, uint8_t *level, uint32_t *catego
 bool cbctl_diag_control_supported(const cbctl_link_t *link)
 {
     return link != NULL && link->magic == CBCTL_LINK_MAGIC && link->diag_ctl_supported;
+}
+
+/* ---- provisioning -------------------------------------------------------------------------
+ *
+ * Intents, like everything else here. Each marks the declaration dirty ONLY on an actual change
+ * — a caller may legitimately re-state its whole configuration every pass, and making that
+ * re-transmit would be the same defect the feed had when re-declaring it starved every other
+ * message. */
+static cbctl_status_t prov_touch(cbctl_link_t *link)
+{
+    link->prov_dirty = true;
+    link->prov_tries = 0u;
+    return CBCTL_OK;
+}
+
+cbctl_status_t cbctl_provision_evse_id(cbctl_link_t *link, const char *id)
+{
+    size_t n;
+
+    if (link == NULL || link->magic != CBCTL_LINK_MAGIC || id == NULL) {
+        return CBCTL_E_ARG;
+    }
+    n = strlen(id);
+    /* REFUSED AT THE CALL, not one round trip later. An EVSEID outside ISO 15118-2's 7..37 is
+     * rejected by strict vehicles on every message of the charge loop, and that surfaces as
+     * "the car stopped talking" rather than as a configuration error anybody can act on. */
+    if (n < CBPLC_EVSE_ID_MIN || n > CBPLC_EVSE_ID_MAX) {
+        return CBCTL_E_ARG;
+    }
+    if (link->prov.evse_id_set && link->prov.evse_id_len == (uint8_t)n &&
+        memcmp(link->prov.evse_id, id, n) == 0) {
+        return CBCTL_OK;   /* unchanged: free */
+    }
+    memcpy(link->prov.evse_id, id, n);
+    link->prov.evse_id[n] = '\0';
+    link->prov.evse_id_len = (uint8_t)n;
+    link->prov.evse_id_set = true;
+    return prov_touch(link);
+}
+
+cbctl_status_t cbctl_provision_protocols(cbctl_link_t *link, uint8_t mask)
+{
+    if (link == NULL || link->magic != CBCTL_LINK_MAGIC) {
+        return CBCTL_E_ARG;
+    }
+    /* Zero would mean "negotiate nothing", i.e. a charger that answers no vehicle. Never what a
+     * caller meant, and not expressible. */
+    if (mask == 0u || (mask & (uint8_t)~CBCTL_PROTO_ALL) != 0u) {
+        return CBCTL_E_ARG;
+    }
+    if (link->prov.protocol_mask_set && link->prov.protocol_mask == mask) {
+        return CBCTL_OK;
+    }
+    link->prov.protocol_mask = mask;
+    link->prov.protocol_mask_set = true;
+    return prov_touch(link);
+}
+
+cbctl_status_t cbctl_provision_attn_trim_db(cbctl_link_t *link, int8_t db)
+{
+    if (link == NULL || link->magic != CBCTL_LINK_MAGIC) {
+        return CBCTL_E_ARG;
+    }
+    if (db < CBPLC_ATTN_TRIM_MIN || db > CBPLC_ATTN_TRIM_MAX) {
+        return CBCTL_E_ARG;
+    }
+    if (link->prov.attn_trim_set && link->prov.attn_trim_db == db) {
+        return CBCTL_OK;
+    }
+    link->prov.attn_trim_db = db;
+    link->prov.attn_trim_set = true;
+    return prov_touch(link);
+}
+
+cbctl_status_t cbctl_provision_feed_deadline_ms(cbctl_link_t *link, uint16_t ms)
+{
+    if (link == NULL || link->magic != CBCTL_LINK_MAGIC) {
+        return CBCTL_E_ARG;
+    }
+    if (ms > CBPLC_SESSION_PARAM_TIMEOUT_MAX_MS) {
+        return CBCTL_E_ARG;
+    }
+    if (link->prov.session_timeout_set && link->prov.session_timeout_ms == ms) {
+        return CBCTL_OK;
+    }
+    link->prov.session_timeout_ms = ms;
+    link->prov.session_timeout_set = true;
+    return prov_touch(link);
+}
+
+bool cbctl_provision_supported(const cbctl_link_t *link)
+{
+    return link != NULL && link->magic == CBCTL_LINK_MAGIC && link->prov_supported;
+}
+
+cbctl_status_t cbctl_request_restart(cbctl_link_t *link, cbctl_op_t *out_op)
+{
+    if (link == NULL || link->magic != CBCTL_LINK_MAGIC) {
+        return CBCTL_E_ARG;
+    }
+    if (link->state != CBCTL_LINK_READY) {
+        return (link->state == CBCTL_LINK_QUARANTINED) ? CBCTL_E_QUARANTINED
+                                                       : CBCTL_E_NOT_IDENTIFIED;
+    }
+    /* REFUSED WHILE WE ARE HOLDING A CONTACTOR. The board has its own gate and it is the
+     * authoritative one, but asking it to reboot while this controller is actively leasing a
+     * relay closed is a self-cancelling instruction — the same class as power_ready-while-
+     * stopping, and refused at the call for the same reason. */
+    if ((link->relay_state & CBPLC_RELAY_ALL) != 0u) {
+        return CBCTL_E_CONTRADICTORY;
+    }
+    link->restart_pending = true;
+    if (out_op != NULL) {
+        *out_op = new_op(link, (uint8_t)CBPLC_T_RESTART);
+    }
+    return CBCTL_OK;
 }

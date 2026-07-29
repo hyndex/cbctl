@@ -2,6 +2,7 @@
 
 #include "cbctl/cbctl.h"
 #include "cbplc/diag.h"
+#include "cbplc/provision.h"
 
 #include "cbplc/limits.h"
 
@@ -135,14 +136,17 @@ static void plc_on_message(void *user, const cbplc_msg_t *msg, cbplc_err_t statu
          * the same space-separated key=value shape. Keeping the SHAPE honest is what makes
          * the parser test meaningful — including neighbours whose names share a tail, so a
          * substring match would be caught. */
-        char body[320];
+        char body[384];
         const int n = snprintf(body, sizeof body,
             "cp=%c slac_matched=%d secc_active=%d secc_streams=%lu last_stop=1 stop=%d "
             "ev_mac=%02X%02X%02X%02X%02X%02X ev_mac_ok=%d up_ms=%lu "
             "relay_safety_opens=%lu relay_lease_opens=%lu gun_open_timeouts=%lu "
             "safety=%d relay_closed=0x%02X ev_soc=%u ev_ready=%d ev_pause=%d "
             "ev_tgt_mv=%lu ev_tgt_ma=%lu dc_ans=%lu "
-            "status_overflow=0 b1_dwell=1500",
+            /* The TAIL KEY must match the firmware's real last field, or every parse here
+             * reads as truncated — which is the truncation guard working, and exactly what
+             * caught this when the firmware's STATUS grew. Keep it last. */
+            "status_overflow=0 b1_dwell=1500 " CBCTL_STATUS_TAIL_KEY "=0",
             lb->cp ? lb->cp : 'A', lb->slac_matched ? 1 : 0, lb->secc_active ? 1 : 0,
             (unsigned long)lb->secc_streams, lb->stop_latched ? 1 : 0,
             lb->ev_mac[0], lb->ev_mac[1], lb->ev_mac[2], lb->ev_mac[3], lb->ev_mac[4],
@@ -201,6 +205,33 @@ static void plc_on_message(void *user, const cbplc_msg_t *msg, cbplc_err_t statu
         lb->auth_seen++;
         break;
     case CBPLC_T_HEARTBEAT: lb->heartbeat_seen++; break;
+
+    case CBPLC_T_PROVISION: {
+        if (lb->provision_unsupported) {
+            /* A board built before provisioning existed. cbplc's default arm answers an
+             * unknown type with BAD_TYPE rather than silence — "a feature gap, not a dead
+             * link" — and that is exactly what a controller must be able to detect. */
+            ack[0] = (uint8_t)CBPLC_E_BAD_TYPE;
+        } else {
+            const cbplc_err_t rc =
+                cbplc_provision_apply(&lb->prov, msg->payload, msg->payload_len);
+            ack[0] = (uint8_t)rc;
+            lb->provision_seen++;
+        }
+        if (lb->provision_unsupported) {
+            lb->provision_seen++;
+        }
+        (void)cbplc_respond(&lb->plc, CBPLC_T_ACK, msg->request_id, ack, 1u);
+        return;
+    }
+
+    case CBPLC_T_RESTART: {
+        lb->restart_seen++;
+        ack[0] = lb->restart_refuse_code;
+        /* Answered with its OWN type, not an ACK, so the gate verdict is unambiguous. */
+        (void)cbplc_respond(&lb->plc, CBPLC_T_RESTART, msg->request_id, ack, 1u);
+        return;
+    }
 
     case CBPLC_T_DIAG: {
         cbplc_diag_cmd_t cmd = CBPLC_DIAG_DRAIN;

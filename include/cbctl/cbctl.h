@@ -22,6 +22,7 @@
 #include "cbctl/units.h"
 
 #include "cbplc/protocol_generated.h"
+#include "cbplc/provision.h"
 #include "cbplc/safety.h"
 #include "cbplc/session.h"
 #include "cbplc/transport.h"
@@ -99,6 +100,15 @@ extern "C" {
  * whatever the most recent complete STATUS said. Without a bound on that, a board that stops
  * answering STATUS — or one whose STATUS is truncated every time — leaves a controller reading
  * "vehicle present, session active" indefinitely and acting on history. Four missed polls. */
+/* THE LAST KEY IN cbplc's STATUS FORMAT STRING, and therefore the proof a line arrived whole.
+ *
+ * Must be kept in step with cbplc's build_status() and with tools/probe.py's TAIL_KEY. A
+ * sentinel that is no longer last does not fail loudly — it simply stops detecting truncation,
+ * and the keys that fell off read as absent while every flag derived from them reads false. */
+#ifndef CBCTL_STATUS_TAIL_KEY
+#define CBCTL_STATUS_TAIL_KEY "prov_timeout"
+#endif
+
 #ifndef CBCTL_OBSERVATION_STALE_MS
 #define CBCTL_OBSERVATION_STALE_MS 4000u
 /* An EV target older than this is not a demand any more. Freshness is the honest test: cbplc
@@ -150,6 +160,13 @@ extern "C" {
 /* How many times one control intent may be re-asserted before cbctl stops spending round trips
  * on it. Three covers a lost frame or two; beyond that the board is answering something we did
  * not ask for and repeating will not change its mind. */
+/* How many times one provisioning declaration is re-sent before cbctl stops. Three covers a
+ * lost frame or two; beyond that the board is refusing a value and repeating cannot change its
+ * mind. The intent stays in link->prov either way, and a board reset re-arms it. */
+#ifndef CBCTL_PROV_TRIES
+#define CBCTL_PROV_TRIES 3u
+#endif
+
 #ifndef CBCTL_DIAG_CTL_TRIES
 #define CBCTL_DIAG_CTL_TRIES 3u
 #endif
@@ -391,6 +408,10 @@ typedef struct {
     cbctl_op_t       op;
     cbctl_op_state_t op_state;
     uint8_t          op_gate;
+    /* Which cbplc message type the outstanding op is waiting for. Without it, any branch that
+     * transmitted while an op was pending could claim the wire for it — and a RELAY ack then
+     * resolved a queued RESTART as applied by a board that never saw one. */
+    uint8_t          op_type;
     /* True only while the op's OWN request is on the wire. Without it, the completion of an
      * unrelated in-flight message (a heartbeat, an auth re-assertion) was attributed to the
      * caller's op and reported it LOST. */
@@ -401,6 +422,19 @@ typedef struct {
     uint32_t relay_hold_ms;
     cbctl_instant_t last_relay;
     bool     relay_dirty;   /* a change the tick has not yet put on the wire */
+
+    /* Per-charger identity and per-board calibration. Inert until cbctl_provision_*() is
+     * called: an un-declaring controller puts nothing extra on the wire and the board keeps the
+     * compiled defaults it always had. */
+    cbplc_provision_t prov;
+    bool     prov_dirty;        /* a declaration the tick has not yet put on the wire */
+    bool     prov_supported;    /* the board ACKed a declaration rather than CBPLC_E_BAD_TYPE  */
+    bool     prov_probed;       /* we have asked at least once, so "false" above is a verdict  */
+    bool     prov_inflight;
+    uint8_t  prov_tries;
+    uint32_t prov_accepted, prov_refused;
+    cbctl_op_t restart_op;
+    bool     restart_pending, restart_inflight;
 
     /* Board diagnostics. Everything here is inert until cbctl_diag_enable(). */
     cbctl_diag_sink_fn diag_sink;
@@ -815,6 +849,73 @@ bool cbctl_diag_state(const cbctl_link_t *link, uint8_t *level, uint32_t *catego
  * request by draining — in which case draining still works and only the level/category setters
  * are inert. Checking this is how a caller tells "logging is off" from "I cannot turn it on". */
 bool cbctl_diag_control_supported(const cbctl_link_t *link);
+
+/* ---- provisioning: what this CHARGER is, and what this BOARD needs trimmed -----------------
+ *
+ * cbplc stores nothing. It has no NVS, no config file and no board identity, because a stored
+ * id that can corrupt is how a dead board and a misconfigured board became indistinguishable.
+ * So the three facts that belong to a charger rather than to firmware are DECLARED here, held
+ * in the board's RAM while it is powered, and re-asserted by cbctl after a reset — the same
+ * shape as the envelope and the authorisation.
+ *
+ * The controller is the config store. It has a filesystem and already knows all of this.
+ *
+ * Every setter is an intent: nothing blocks, and cbctl_tick() puts it on the wire. All of it is
+ * OFF by default — a controller that never calls these behaves exactly as one built before they
+ * existed, and the board keeps the values that shipped with its firmware. */
+
+/* The charger's identity on the V2G wire. ISO 15118-2 evseIDType is 7..37 characters; a string
+ * outside that is REFUSED here rather than sent, because a vehicle rejects an out-of-schema
+ * EVSEID on every message of the charge loop and that presents as "the car stopped talking".
+ *
+ * There is no fleet-wide default worth having: shipping one is what made every charger we build
+ * announce the same identity. */
+cbctl_status_t cbctl_provision_evse_id(cbctl_link_t *link, const char *id);
+
+/* Which HLC protocols the board may negotiate. Mask of CBCTL_PROTO_*; zero is refused.
+ *
+ * This is an interop instrument. When one vehicle fails on ISO 15118-2 and charges on DIN
+ * 70121, restricting the offer answers "is it the protocol?" in a single session. It takes
+ * effect at SupportedAppProtocol, so a car that offered both simply falls back rather than
+ * failing. */
+#define CBCTL_PROTO_DIN70121 0x01u
+#define CBCTL_PROTO_ISO2     0x02u
+#define CBCTL_PROTO_ALL      (CBCTL_PROTO_DIN70121 | CBCTL_PROTO_ISO2)
+cbctl_status_t cbctl_provision_protocols(cbctl_link_t *link, uint8_t mask);
+
+/* Per-board SLAC receive-path trim in dB, ADDED to the firmware's fixed front-end correction.
+ *
+ * The fixed part models the front end and stays fixed on purpose — an adaptive correction that
+ * solves toward a target attenuation makes a distant vehicle look adjacent, which is the
+ * cross-gun mismatch SLAC exists to prevent. What it cannot model is the rest of the physical
+ * path: cable, connector, coupling, unit-to-unit spread. ISO 15118-3 expects that measured per
+ * device. Store the measured value against the board's MAC and declare it at link-up.
+ *
+ * Bounded to +/-30 dB. This is a calibration knob, never a control loop. */
+cbctl_status_t cbctl_provision_attn_trim_db(cbctl_link_t *link, int8_t db);
+
+/* The board's feed deadline in ms — how long an envelope and measurement stay valid before it
+ * withdraws permission to energise. 0 restores the compiled default.
+ *
+ * BENCH ONLY. The default is correct for production and this exists because interop work needed
+ * the number moved and the only way was a rebuild. The board publishes it in STATUS, so a
+ * charger running a non-default deadline cannot do so invisibly. */
+cbctl_status_t cbctl_provision_feed_deadline_ms(cbctl_link_t *link, uint16_t ms);
+
+/* True once a board has ACKed a declaration. False either because nothing has been declared
+ * yet, or because this firmware predates provisioning and answered CBPLC_E_BAD_TYPE — in which
+ * case the board is running its compiled defaults and cannot be told otherwise. Checking this
+ * is how a caller tells "not declared" from "cannot declare". */
+bool cbctl_provision_supported(const cbctl_link_t *link);
+
+/* Ask the board to reboot.
+ *
+ * REFUSED BY THE BOARD unless the connector is genuinely idle — no vehicle on the pilot, no
+ * session, every relay proven open. It restarts the thing holding the gun contactor, so a
+ * refusal here is the design working, not a failure. Observe the result with cbctl_op_state();
+ * a board that accepts it will stop answering shortly afterwards and come back re-identifying,
+ * at which point cbctl re-asserts every declaration automatically. */
+cbctl_status_t cbctl_request_restart(cbctl_link_t *link, cbctl_op_t *out_op);
 
 #ifdef __cplusplus
 }

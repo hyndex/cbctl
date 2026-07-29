@@ -31,7 +31,7 @@ TESTS   := $(patsubst tests/test_%.c,$(BUILD)/test_%,$(TESTSRC))
 
 OBJ     := $(patsubst %.c,$(BUILD)/obj/%.o,$(VENDOR) $(SRC))
 
-.PHONY: all check test clean vendor live live-dual budget deadman charge example selftest boardlog
+.PHONY: all check test clean vendor live live-dual budget deadman charge example selftest boardlog provision
 # Objects are NOT intermediates. Without this make deletes them after linking, which throws
 # away their .d files, and the next build silently skips a rebuild after a HEADER change —
 # a stale binary that passes is worse than a broken one that fails.
@@ -102,6 +102,13 @@ $(BUILD)/charge_soc: tools/charge_soc.c $(POWSRC) $(OBJ)
 # it links against $(OBJ) alone — it never touches CAN or the meter.
 boardlog: $(BUILD)/board_log
 $(BUILD)/board_log: tools/board_log.c $(OBJ)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) $< $(OBJ) -o $@
+
+# Declare a charger's identity and a board's calibration. Controller-side only: it never
+# authorises, closes a relay or commands a module.
+provision: $(BUILD)/provision
+$(BUILD)/provision: tools/provision.c $(OBJ)
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $< $(OBJ) -o $@
 

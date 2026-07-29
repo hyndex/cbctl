@@ -13,6 +13,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "cbplc/provision.h"
 #include "cbplc/session.h"
 #include "cbplc/transport.h"
 
@@ -100,6 +101,16 @@ typedef struct {
     uint32_t diag_taken;        /* read cursor into diag_text */
     unsigned diag_drains_seen, diag_ctl_seen, diag_clear_seen;
     uint8_t  diag_last_cmd;
+
+    /* --- provisioning and restart, modelled -------------------------------------------
+     *
+     * `provision_unsupported` is the one that matters: with it TRUE the fake board answers
+     * CBPLC_E_BAD_TYPE exactly as a firmware built before PROVISION existed, which is the
+     * compatibility case and the only place it can be exercised. */
+    cbplc_provision_t prov;
+    bool     provision_unsupported;
+    unsigned provision_seen, restart_seen;
+    uint8_t  restart_refuse_code;   /* non-zero: the board's idle gate says no */
 
     /* Observability for assertions. */
     unsigned ctrl_frames_in, plc_frames_in;

@@ -45,6 +45,7 @@
 #include <stdint.h>
 
 #include "cbplc/protocol_generated.h"
+#include "cbplc/provision.h"   /* CBPLC_SESSION_PARAM_TIMEOUT_MAX_MS bounds the override */
 
 #ifdef __cplusplus
 extern "C" {
@@ -138,6 +139,14 @@ typedef struct {
     uint32_t rejects;        /* malformed or implausible, per message */
     uint32_t expiries;       /* transitions from fresh to stale */
     bool was_fresh;          /* edge detection for `expiries` */
+    /* THE FEED DEADLINE, runtime-overridable for the bench and ONLY for the bench.
+     *
+     * 0 means "use CBPLC_LIMITS_STALE_MS", which is what production runs and what every board
+     * comes up with — this does not persist. It exists because interop work repeatedly needed
+     * this number moved and the only way was a rebuild and a reflash. It is bounded by the
+     * PROVISION codec and published in STATUS, so a charger running a non-default deadline
+     * cannot do so invisibly. */
+    uint32_t stale_ms;
 } cbplc_limits_t;
 
 void cbplc_limits_init(cbplc_limits_t *l);
@@ -163,6 +172,12 @@ size_t cbplc_limits_encode_measurement(const cbplc_measurement_t *m, uint8_t *ou
 
 /* Are BOTH feeds fresh? Both, because a DC response needs limits and measurements
  * together — one without the other cannot fill a CableCheckRes or a CurrentDemandRes. */
+/* Override the feed deadline. 0 restores the compiled default. Values outside
+ * 1..CBPLC_SESSION_PARAM_TIMEOUT_MAX_MS are clamped rather than refused: the caller has already
+ * been bounds-checked by the PROVISION codec, and a clamp here is the belt to that braces. */
+void cbplc_limits_set_stale_ms(cbplc_limits_t *l, uint32_t ms);
+uint32_t cbplc_limits_stale_ms(const cbplc_limits_t *l);
+
 bool cbplc_limits_fresh(const cbplc_limits_t *l, uint32_t now_ms);
 
 /* Is the feed stale but still inside the grace window — i.e. answer the vehicle, but

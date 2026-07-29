@@ -7,7 +7,7 @@
 
 #define CBPLC_SCHEMA_ID          "cbplc.protocol"
 #define CBPLC_SCHEMA_VERSION     1u
-#define CBPLC_SCHEMA_SHA256      "34741988c3337344b281f5d7a1cfad940e098a65c8a6ef5c215d938b5f05cdc6"
+#define CBPLC_SCHEMA_SHA256      "7ceefccb26e249f29cbb9ee15ae1a52b4946d7a3f32870f594ff86d2acdb8d12"
 
 /* --- message ---------------------------------------------------------- */
 #define CBPLC_WIRE_VERSION       1u
@@ -46,6 +46,8 @@ typedef enum {
     CBPLC_T_ACK = 14,
     CBPLC_T_EVENT = 15,
     CBPLC_T_DIAG = 16,
+    CBPLC_T_PROVISION = 17,
+    CBPLC_T_RESTART = 18,
 } cbplc_type_t;
 
 typedef enum {

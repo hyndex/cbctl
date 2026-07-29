@@ -93,6 +93,8 @@ bool cbplc_type_known(uint8_t t)
     case CBPLC_T_ACK:
     case CBPLC_T_EVENT:
     case CBPLC_T_DIAG:
+    case CBPLC_T_PROVISION:
+    case CBPLC_T_RESTART:
         return true;
     }
     return false;

@@ -1259,6 +1259,210 @@ TEST(clearing_discards_the_previous_sessions_tail)
     CHECK(g_sink_len == 0u);
 }
 
+
+/* ---- provisioning ---------------------------------------------------------------------------
+ *
+ * The properties that matter: nothing on the wire unless a caller declares something, a
+ * declaration is cleared only by the board's OWN ack, a firmware that predates this is detected
+ * and not argued with, and a board reset re-asserts — because cbplc holds the declaration in RAM
+ * and a reset silently returns the EVSE ID to the fleet-wide fallback.
+ */
+TEST(provisioning_is_silent_until_something_is_declared)
+{
+    cbctl_link_t link;
+    cbctl_loopback_t lb;
+    uint32_t now = 1000u;
+
+    bring_up(&link, &lb, &now);
+    for (int i = 0; i < 100; i++) { round_trip(&link, &lb, &now, 100u); }
+    CHECK(lb.provision_seen == 0u);
+    CHECK(!cbctl_provision_supported(&link));
+}
+
+TEST(a_declaration_reaches_the_board_and_is_confirmed)
+{
+    cbctl_link_t link;
+    cbctl_loopback_t lb;
+    uint32_t now = 1000u;
+
+    bring_up(&link, &lb, &now);
+    CHECK(cbctl_provision_evse_id(&link, "DE*ABC*E000100010001") == CBCTL_OK);
+    CHECK(cbctl_provision_protocols(&link, CBCTL_PROTO_DIN70121) == CBCTL_OK);
+    CHECK(cbctl_provision_attn_trim_db(&link, -6) == CBCTL_OK);
+    for (int i = 0; i < 40; i++) { round_trip(&link, &lb, &now, 100u); }
+
+    CHECK(lb.provision_seen >= 1u);
+    CHECK(lb.prov.evse_id_set && strcmp(lb.prov.evse_id, "DE*ABC*E000100010001") == 0);
+    CHECK(lb.prov.protocol_mask == CBCTL_PROTO_DIN70121);
+    CHECK(lb.prov.attn_trim_db == -6);
+    CHECK(cbctl_provision_supported(&link));
+    CHECK(!link.prov_dirty);
+
+    /* AND IT DOES NOT REPEAT. An identity is not a feed; re-sending it every second would be
+     * pure noise on a stop-and-wait wire. */
+    {
+        const unsigned seen = lb.provision_seen;
+        for (int i = 0; i < 200; i++) { round_trip(&link, &lb, &now, 100u); }
+        CHECK(lb.provision_seen == seen);
+    }
+}
+
+/* Re-stating an unchanged configuration must be FREE — a caller may legitimately assert its
+ * whole config every pass, and making that re-transmit is the defect the feed once had. */
+TEST(re_declaring_the_same_values_sends_nothing)
+{
+    cbctl_link_t link;
+    cbctl_loopback_t lb;
+    uint32_t now = 1000u;
+    unsigned seen;
+
+    bring_up(&link, &lb, &now);
+    CHECK(cbctl_provision_evse_id(&link, "DE*ABC*E000100010001") == CBCTL_OK);
+    for (int i = 0; i < 40; i++) { round_trip(&link, &lb, &now, 100u); }
+    seen = lb.provision_seen;
+
+    for (int i = 0; i < 60; i++) {
+        CHECK(cbctl_provision_evse_id(&link, "DE*ABC*E000100010001") == CBCTL_OK);
+        CHECK(cbctl_provision_protocols(&link, CBCTL_PROTO_ALL) == CBCTL_E_ARG ||
+              link.prov.protocol_mask == CBCTL_PROTO_ALL);
+        round_trip(&link, &lb, &now, 100u);
+    }
+    printf("    provision frames after 60 re-declarations: %u (was %u)\n",
+           lb.provision_seen, seen);
+    CHECK(lb.provision_seen <= seen + 1u);   /* at most the one genuine protocol change */
+}
+
+/* THE LOAD-BEARING ONE. cbplc keeps a declaration in RAM only, so a reset returns the EVSE ID
+ * to the compiled fleet-wide fallback. A controller that did not re-assert would leave a
+ * charger quietly announcing the wrong identity for the rest of its uptime. */
+TEST(a_board_reset_re_asserts_the_identity)
+{
+    cbctl_link_t link;
+    cbctl_loopback_t lb;
+    uint32_t now = 1000u;
+
+    bring_up(&link, &lb, &now);
+    CHECK(cbctl_provision_evse_id(&link, "IN*JPX*E777") == CBCTL_OK);
+    for (int i = 0; i < 40; i++) { round_trip(&link, &lb, &now, 100u); }
+    CHECK(lb.prov.evse_id_set);
+
+    /* The board reboots: RAM gone, back to compiled defaults. */
+    memset(&lb.prov, 0, sizeof lb.prov);
+    lb.up_ms = 1u;
+    cbctl_link_reestablish(&link);
+    for (int i = 0; i < 60; i++) { round_trip(&link, &lb, &now, 100u); }
+    CHECK(lb.prov.evse_id_set && strcmp(lb.prov.evse_id, "IN*JPX*E777") == 0);
+}
+
+/* An out-of-schema EVSEID is refused at the CALL. A vehicle rejects it on every message of the
+ * charge loop, and that presents as "the car stopped talking" rather than a config error. */
+TEST(an_out_of_schema_evse_id_never_reaches_the_wire)
+{
+    cbctl_link_t link;
+    cbctl_loopback_t lb;
+    uint32_t now = 1000u;
+    char toolong[64];
+
+    bring_up(&link, &lb, &now);
+    memset(toolong, 'A', sizeof toolong);
+    toolong[CBPLC_EVSE_ID_MAX + 1u] = '\0';
+
+    CHECK(cbctl_provision_evse_id(&link, "SHORT!") == CBCTL_E_ARG);
+    CHECK(cbctl_provision_evse_id(&link, toolong) == CBCTL_E_ARG);
+    CHECK(cbctl_provision_evse_id(&link, NULL) == CBCTL_E_ARG);
+    CHECK(cbctl_provision_protocols(&link, 0u) == CBCTL_E_ARG);
+    CHECK(cbctl_provision_protocols(&link, 0x40u) == CBCTL_E_ARG);
+    CHECK(cbctl_provision_attn_trim_db(&link, 99) == CBCTL_E_ARG);
+    CHECK(cbctl_provision_attn_trim_db(&link, -99) == CBCTL_E_ARG);
+    CHECK(cbctl_provision_feed_deadline_ms(&link, 60000u) == CBCTL_E_ARG);
+
+    for (int i = 0; i < 40; i++) { round_trip(&link, &lb, &now, 100u); }
+    CHECK(lb.provision_seen == 0u);
+}
+
+/* An older firmware NACKs an unknown type. cbctl must notice, stop arguing, and keep the intent
+ * so a reflash or a reset re-asserts it. */
+TEST(a_firmware_that_predates_provisioning_is_detected_not_argued_with)
+{
+    cbctl_link_t link;
+    cbctl_loopback_t lb;
+    uint32_t now = 1000u;
+
+    bring_up(&link, &lb, &now);
+    lb.provision_unsupported = true;         /* answers CBPLC_E_BAD_TYPE */
+    CHECK(cbctl_provision_evse_id(&link, "DE*ABC*E000100010001") == CBCTL_OK);
+    for (int i = 0; i < 200; i++) { round_trip(&link, &lb, &now, 100u); }
+
+    CHECK(!cbctl_provision_supported(&link));
+    printf("    frames sent to a board that cannot provision: %u\n", lb.provision_seen);
+    CHECK(lb.provision_seen <= CBCTL_PROV_TRIES);   /* it stopped, rather than retrying forever */
+    CHECK(link.prov.evse_id_set);                   /* but the intent survives for a reflash */
+}
+
+/* A declaration that is SENT and LOST must be re-sent. Believing it because it left the host is
+ * how a charger ends up announcing an identity nobody applied. */
+TEST(a_swallowed_provision_reply_is_retried_then_bounded)
+{
+    cbctl_link_t link;
+    cbctl_loopback_t lb;
+    uint32_t now = 1000u;
+
+    bring_up(&link, &lb, &now);
+    lb.swallow_type = (uint8_t)CBPLC_T_PROVISION;
+    CHECK(cbctl_provision_evse_id(&link, "DE*ABC*E000100010001") == CBCTL_OK);
+    for (int i = 0; i < 200; i++) { round_trip(&link, &lb, &now, 100u); }
+    CHECK(link.prov_dirty);                  /* never believed */
+    CHECK(!cbctl_provision_supported(&link));
+
+    /* The board recovers and a reset re-arms the budget. */
+    lb.swallow_type = 0u;
+    cbctl_link_reestablish(&link);
+    for (int i = 0; i < 80; i++) { round_trip(&link, &lb, &now, 100u); }
+    CHECK(lb.prov.evse_id_set);
+    CHECK(!link.prov_dirty);
+}
+
+/* Restart is refused while WE hold a contactor — a self-cancelling instruction, refused at the
+ * call for the same reason as power_ready-while-stopping. */
+TEST(restart_is_refused_while_holding_a_contactor)
+{
+    cbctl_link_t link;
+    cbctl_loopback_t lb;
+    uint32_t now = 1000u;
+    cbctl_op_t op;
+
+    bring_up(&link, &lb, &now);
+    CHECK(cbctl_relay_close(&link, CBPLC_RELAY_GUN, 3000u, NULL) == CBCTL_OK);
+    CHECK(cbctl_request_restart(&link, &op) == CBCTL_E_CONTRADICTORY);
+
+    CHECK(cbctl_relay_open(&link, CBPLC_RELAY_ALL, NULL) == CBCTL_OK);
+    CHECK(cbctl_request_restart(&link, &op) == CBCTL_OK);
+    for (int i = 0; i < 40 && cbctl_op_state(&link, op) == CBCTL_OP_PENDING; i++) {
+        round_trip(&link, &lb, &now, 100u);
+    }
+    CHECK(cbctl_op_state(&link, op) == CBCTL_OP_APPLIED);
+    CHECK(lb.restart_seen == 1u);
+}
+
+/* The board's own gate is the authoritative one, and its refusal must read as a refusal rather
+ * than as a lost message. */
+TEST(a_board_that_refuses_a_restart_reports_the_gate)
+{
+    cbctl_link_t link;
+    cbctl_loopback_t lb;
+    uint32_t now = 1000u;
+    cbctl_op_t op;
+
+    bring_up(&link, &lb, &now);
+    lb.restart_refuse_code = 9u;             /* CBPLC_E_NOT_READY: connector not idle */
+    CHECK(cbctl_request_restart(&link, &op) == CBCTL_OK);
+    for (int i = 0; i < 40 && cbctl_op_state(&link, op) == CBCTL_OP_PENDING; i++) {
+        round_trip(&link, &lb, &now, 100u);
+    }
+    CHECK(cbctl_op_state(&link, op) == CBCTL_OP_REFUSED);
+    CHECK(cbctl_op_gate(&link, op) == 9u);
+}
+
 int main(void)
 {
     printf("link\n");
@@ -1306,6 +1510,15 @@ int main(void)
     RUN(a_board_reset_re_arms_the_trace);
     RUN(a_dropped_ring_is_reported_not_hidden);
     RUN(clearing_discards_the_previous_sessions_tail);
+    RUN(provisioning_is_silent_until_something_is_declared);
+    RUN(a_declaration_reaches_the_board_and_is_confirmed);
+    RUN(re_declaring_the_same_values_sends_nothing);
+    RUN(a_board_reset_re_asserts_the_identity);
+    RUN(an_out_of_schema_evse_id_never_reaches_the_wire);
+    RUN(a_firmware_that_predates_provisioning_is_detected_not_argued_with);
+    RUN(a_swallowed_provision_reply_is_retried_then_bounded);
+    RUN(restart_is_refused_while_holding_a_contactor);
+    RUN(a_board_that_refuses_a_restart_reports_the_gate);
     if (g_fail) {
         printf("FAIL link (%d)\n", g_fail);
         return 1;

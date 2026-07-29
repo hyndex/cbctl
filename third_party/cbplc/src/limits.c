@@ -21,7 +21,7 @@
  * Signed is still rollover-safe for every real age: it misreads only at ±24.8 days, and
  * both real quantities here are bounded — ages by the stale threshold (seconds), future
  * skew by one loop pass (milliseconds). */
-static bool stale(uint32_t now_ms, uint32_t since_ms)
+static bool stale_within(uint32_t now_ms, uint32_t since_ms, uint32_t window_ms)
 {
     if (since_ms == 0u) {
         return true; /* never received is not fresh */
@@ -30,7 +30,7 @@ static bool stale(uint32_t now_ms, uint32_t since_ms)
     if (age < 0) {
         return false; /* stamped after `now` was captured: this very pass, maximally fresh */
     }
-    return (uint32_t)age >= CBPLC_LIMITS_STALE_MS;
+    return (uint32_t)age >= window_ms;
 }
 
 static uint32_t rd32(const uint8_t *p)
@@ -177,6 +177,27 @@ size_t cbplc_limits_encode_measurement(const cbplc_measurement_t *m, uint8_t *ou
     return CBPLC_FEEDBACK_PAYLOAD_LEN;
 }
 
+void cbplc_limits_set_stale_ms(cbplc_limits_t *l, uint32_t ms)
+{
+    if (l == NULL) {
+        return;
+    }
+    if (ms != 0u && ms > CBPLC_SESSION_PARAM_TIMEOUT_MAX_MS) {
+        ms = CBPLC_SESSION_PARAM_TIMEOUT_MAX_MS;
+    }
+    l->stale_ms = ms;
+}
+
+uint32_t cbplc_limits_stale_ms(const cbplc_limits_t *l)
+{
+    /* Zero is "not overridden", never "expire instantly" — a deadline of 0 ms would refuse
+     * energy on a perfectly healthy feed, which is the opposite of what an unset field means. */
+    if (l == NULL || l->stale_ms == 0u) {
+        return CBPLC_LIMITS_STALE_MS;
+    }
+    return l->stale_ms;
+}
+
 bool cbplc_limits_fresh(const cbplc_limits_t *l, uint32_t now_ms)
 {
     if (l == NULL) {
@@ -184,7 +205,11 @@ bool cbplc_limits_fresh(const cbplc_limits_t *l, uint32_t now_ms)
     }
     /* BOTH. A DC response needs limits and measurements together; one without the other
      * cannot fill a CableCheckRes or a CurrentDemandRes. */
-    return !stale(now_ms, l->envelope_ms) && !stale(now_ms, l->measurement_ms);
+    {
+        const uint32_t w = cbplc_limits_stale_ms(l);
+        return !stale_within(now_ms, l->envelope_ms, w) &&
+               !stale_within(now_ms, l->measurement_ms, w);
+    }
 }
 
 bool cbplc_limits_in_grace(const cbplc_limits_t *l, uint32_t now_ms)
@@ -260,10 +285,10 @@ const char *cbplc_limits_refusal(const cbplc_limits_t *l, uint32_t now_ms)
     if (l->measurement_ms == 0u) {
         return "no_feedback";
     }
-    if (stale(now_ms, l->envelope_ms)) {
+    if (stale_within(now_ms, l->envelope_ms, cbplc_limits_stale_ms(l))) {
         return "limits_stale";
     }
-    if (stale(now_ms, l->measurement_ms)) {
+    if (stale_within(now_ms, l->measurement_ms, cbplc_limits_stale_ms(l))) {
         return "feedback_stale";
     }
     if (!l->envelope.power_ready) {
