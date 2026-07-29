@@ -89,6 +89,18 @@ static uint32_t now_ms(void)
  *
  * Default stays {1,2} so nothing changes for a single-gun bus; pass the list to scope it. */
 static unsigned char kModuleAddr[8] = { 1u, 2u };
+
+/* WHICH DCM3366 LOOP MEASURES THIS GUN, and getting it wrong is silent.
+ *
+ * The meter is two-loop — ch1 voltage at 0x203C, ch2 at 0x203E — and the loops are per gun.
+ * This was hardcoded to 1, which was right on gun 1 and catastrophically wrong on gun 2: the
+ * meter reported the OTHER gun's idle loop, so the vehicle was told the bus sat at 0 V for the
+ * whole of PreCharge, never saw it converge, and dropped the session. The contactor then opened
+ * and re-closed on every retry — audible relay chatter whose real cause was a meter channel. */
+static int g_meter_ch = 1;
+static int g_meter_ok;
+static double g_meter_v, g_meter_a;
+static unsigned g_meter_mismatch;
 static int g_nmod = 2;
 #define NMOD (g_nmod)
 
@@ -108,6 +120,32 @@ static int parse_modules(const char *s)
     }
     g_nmod = n;
     return n;
+}
+
+/* WHICH BOARD IS THIS, REALLY.
+ *
+ * USB enumeration order is not stable, and reflashing two boards is enough to swap them:
+ * measured on this bench within one session, ttyACM0 went from D0:CF:13:73:0A:68 to
+ * D0:CF:13:71:FF:54. Everything inferred from the old mapping — which gun, therefore which
+ * module, therefore which meter loop — was then wrong, and the failure presented as "the
+ * modules produce nothing" rather than as "you are talking to the other gun".
+ *
+ * cbctl has carried cbctl_expect_mac() for exactly this since the dual-board work; this tool
+ * simply was not using it. Set CBCTL_EXPECT_MAC and a port swap becomes a refusal at start-up
+ * instead of a charge delivered to the gun nobody asked for. */
+static int parse_mac(const char *s, uint8_t out[6])
+{
+    int i;
+    unsigned b[6];
+    if (s == NULL) { return -1; }
+    if (sscanf(s, "%x:%x:%x:%x:%x:%x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6) {
+        return -1;
+    }
+    for (i = 0; i < 6; i++) {
+        if (b[i] > 0xFFu) { return -1; }
+        out[i] = (uint8_t)b[i];
+    }
+    return 0;
 }
 
 /* ---- main ------------------------------------------------------------------------------- */
@@ -269,10 +307,18 @@ int main(int argc, char **argv)
      * claim METER_MEASURED. A missing meter is not a reason to refuse to charge. */
     const char *meterdev = (argc > 5) ? argv[5] : "";
     /* argv[6]: the module addresses wired to THIS gun. See kModuleAddr. */
+    /* argv[7]: the meter loop. Defaults to the first module address, which is the per-gun
+     * convention on this bench (module 1 -> gun 1, module 2 -> gun 2). */
     if (argc > 6 && parse_modules(argv[6]) <= 0) {
         fprintf(stderr, "bad module list '%s' — expected e.g. 1 or 1,2\n", argv[6]);
         return 2;
     }
+    g_meter_ch = (argc > 7) ? atoi(argv[7]) : (int)kModuleAddr[0];
+    if (g_meter_ch < 1 || g_meter_ch > 2) {
+        fprintf(stderr, "meter channel must be 1 or 2 (the DCM3366 has two loops)\n");
+        return 2;
+    }
+
     int start_soc = -1, last_soc = -1, target_soc = -1;
     double peak_v = 0.0, peak_a = 0.0, wh = 0.0;
     uint32_t t0, last_report = 0u, last_wh = 0u;
@@ -280,7 +326,9 @@ int main(int argc, char **argv)
     /* FAST-FAIL TIMEOUTS. A session test that only ends on the operator's patience burns
      * vehicle time and cycles contactors for nothing. Each of these names a specific thing
      * that should have happened by now, so a failure reports WHAT did not arrive. */
-    uint32_t t_session = 0u, t_volts = 0u, t_demand = 0u;
+    uint32_t t_session = 0u, t_volts = 0u, t_demand = 0u, t_gun_open = 0u;
+    uint8_t expect_mac[6];
+    int want_mac = 0, mac_checked = 0;
     int bailed = 0;
     const uint32_t kNoSessionMs = 180000u;  /* room for a few replug retries before giving up */
     /* A vehicle that has tried and failed backs off for MINUTES before trying again, so a bench
@@ -303,7 +351,28 @@ int main(int argc, char **argv)
 
     /* Line-buffer stdout: redirected to a file it is block-buffered by default, and a charge
      * log that only appears after the process dies is useless exactly when it is needed. */
+    {
+        const char *em = getenv("CBCTL_EXPECT_MAC");
+        if (em != NULL && em[0] != '\0') {
+            if (parse_mac(em, expect_mac) != 0) {
+                fprintf(stderr, "bad CBCTL_EXPECT_MAC '%s' (want aa:bb:cc:dd:ee:ff)\n", em);
+                return 2;
+            }
+            want_mac = 1;
+        }
+    }
+
     setvbuf(stdout, NULL, _IOLBF, 0);
+    /* AFTER setvbuf, never before. setvbuf is only valid before any other operation on the
+     * stream, so a printf above it silently leaves stdout fully buffered — and a charge whose
+     * output appears only when the process dies is invisible exactly while it is being watched.
+     * Cost me one bench cycle. */
+    {
+        int mi;
+        printf("meter loop: ch%d   modules:", g_meter_ch);
+        for (mi = 0; mi < NMOD; mi++) { printf("%s%u", mi ? "," : " ", kModuleAddr[mi]); }
+        printf("\n");
+    }
     signal(SIGINT, on_sig);
     signal(SIGTERM, on_sig);
 
@@ -323,6 +392,46 @@ int main(int argc, char **argv)
         const char *tr = getenv("CBCTL_TRACE_STATUS");
         rec_open(getenv("CBCTL_SESSION_LOG"));
         {
+            /* PROVISIONING, declared by this process exactly as a real controller does at
+             * link-up. Putting it here rather than in a separate tool is what makes one run an
+             * end-to-end test of the whole stack: the identity the vehicle is told, the trim the
+             * SLAC front end uses, and the charge itself all come from the same link, and the
+             * declaration is re-asserted automatically if the board resets mid-run. */
+            {
+                const char *id = getenv("CBCTL_EVSE_ID");
+                const char *trim_s = getenv("CBCTL_ATTN_TRIM");
+                const char *pr = getenv("CBCTL_PROTOCOLS");
+                if (id != NULL && id[0] != '\0') {
+                    if (cbctl_provision_evse_id(&link, id) != CBCTL_OK) {
+                        fprintf(stderr, "bad CBCTL_EVSE_ID '%s' (need %u..%u printable chars)\n",
+                                id, (unsigned)CBPLC_EVSE_ID_MIN, (unsigned)CBPLC_EVSE_ID_MAX);
+                        power_off();
+                        return 2;
+                    }
+                    printf("provisioning: evse_id=%s\n", id);
+                }
+                if (trim_s != NULL && trim_s[0] != '\0') {
+                    if (cbctl_provision_attn_trim_db(&link, (int8_t)atoi(trim_s)) != CBCTL_OK) {
+                        fprintf(stderr, "bad CBCTL_ATTN_TRIM '%s' (need %d..%d dB)\n", trim_s,
+                                CBPLC_ATTN_TRIM_MIN, CBPLC_ATTN_TRIM_MAX);
+                        power_off();
+                        return 2;
+                    }
+                    printf("provisioning: attn_trim=%s dB\n", trim_s);
+                }
+                if (pr != NULL && pr[0] != '\0') {
+                    uint8_t m = 0u;
+                    if (strstr(pr, "din") != NULL) { m |= CBCTL_PROTO_DIN70121; }
+                    if (strstr(pr, "iso") != NULL) { m |= CBCTL_PROTO_ISO2; }
+                    if (m == 0u || cbctl_provision_protocols(&link, m) != CBCTL_OK) {
+                        fprintf(stderr, "bad CBCTL_PROTOCOLS '%s' (want din, iso2 or din,iso2)\n",
+                                pr);
+                        power_off();
+                        return 2;
+                    }
+                    printf("provisioning: protocols=%s\n", pr);
+                }
+            }
             const char *dl = getenv("CBCTL_DIAG_LOG");
             if (dl != NULL && dl[0] != '\0') {
                 g_diaglog = fopen(dl, "we");
@@ -400,53 +509,57 @@ int main(int argc, char **argv)
          * this", and power_ready/isolation are derived from their own sources. */
         v = 0.0;
         a = 0.0;
-        /* THE METER OUTRANKS THE MODULES, AND ON THIS BENCH IT IS THE ONLY ONE TELLING THE TRUTH.
+        /* THE MODULES ARE THE CONTROL SOURCE. THE METER IS THE WITNESS.
          *
-         * cbmodules is driven here through ALL_SET (§1.2.5, the atomic OnOff+HiLo+I+Vbat+Vout
-         * frame) and takes its telemetry from ALL_SET_RESP. Counted on the wire over one 14 s
-         * run: 108 ALL_SET frames and 2 READ frames — the two being the startup scan. The
-         * Python reference driver polls CMD_VOUT / CMD_IOUT / CMD_STATUS continuously (60 READs
-         * in five seconds), which is why it has ever reported a real current.
+         * This corrects my own earlier change, and both halves are worth recording because each
+         * looked right at the time.
          *
-         * The consequence, measured against a live vehicle: through an entire CurrentDemand
-         * phase cbmodules reported 389.1 V / 0.0 A — the commanded setpoint — while the DCM3366
-         * downstream of the contactor read 358.0 V rising to 359.5 V at 9.9 A and the car's own
-         * EVRESSSOC climbed 25%% -> 26%%. The charge was real; only the number was not. That
-         * false zero was fed to cbplc as present_current for the vehicle to read, kept `wh` at
-         * 0, and fired both the "modules never produced volts" and "stuck in CurrentDemand"
-         * bails on a charger that was working.
+         * I made the METER primary after watching cbmodules report 389.1 V / 0.0 A — its own
+         * commanded setpoint — through a whole CurrentDemand while the DCM3366 measured
+         * 359 V / 9.9 A. That was real, but the CAUSE was that cbmodules' runtime telemetry
+         * probing defaults to disabled (runtime_probe_interval_ms = 0) and this bench had never
+         * enabled it, so the manager never asked the modules anything after the startup scan.
+         * Enabling it was the fix. Promoting the meter on top of that treated the symptom.
          *
-         * Two further reasons the module figure cannot be the primary here even once IOUT is
-         * polled: combined_voltage_v is the MAX across the group, so the second module — idle
-         * on the other gun, sitting at its 389.1 V setpoint — masks the loaded one at 359 V;
-         * and the modules are upstream of the contactor, so they cannot see the circuit the EV
-         * is actually connected to. The meter is after it. Modules remain the fallback for a
-         * bench with no meter, where "some measurement" beats none. */
-        /* THROTTLED, BECAUSE A MODBUS READ ON THE CONTROL TICK IS A KNOWN WAY TO KILL A CHARGE.
+         * And it broke the thing it was meant to protect. The meter sits downstream of the
+         * contactor and reads through a CT: during PRECHARGE there is no current, so it reports
+         * 0 V while the module already sits at the vehicle's requested 355.0 V. We sent that
+         * zero to the car as EVSEPresentVoltage, the car waited for a bus that as far as it could
+         * tell never came up, and dropped the session. Measured, verbatim:
          *
-         * The DCM3366 is Modbus RTU at 9600 baud and the read is SYNCHRONOUS. Doing it every
-         * pass pushed worst tick gap from 398 ms to 595 ms — still inside cbplc's 1500 ms feed
-         * bound, but moving the wrong way, and this project has already had a fleet incident
-         * where a synchronous meter poll on the control tick starved the feed and stalled every
-         * PreCharge. 400 ms is far fresher than the 1500 ms the feed needs and costs one read
-         * every ~60 ticks. Between reads the cached sample is reused; if the meter stops
-         * answering the cache is dropped rather than aged forever, and the modules take over. */
+         *     src=meter 0.0V 0.0A | mod ok 355.0V 0.0A   req=355V/2A
+         *
+         * The contactor then opened and re-closed on every retry — the audible relay chatter,
+         * whose real cause was a measurement source that cannot see the phase it was asked about.
+         *
+         * So: the MODULES answer the vehicle. They are the converter, they know their own output
+         * within one poll, and they can see it with no current flowing, which is exactly what
+         * PreCharge is. The METER stays as an independent instrument on the other side of the
+         * contactor and does what it is good for: proving the two agree once current IS flowing.
+         * A disagreement is REPORTED rather than silently resolved, because "modules 355 V, meter
+         * 0 V" means something different in PreCharge (normal) than in delivery (a broken
+         * circuit), and only a human knows which. */
+        v = 0.0;
+        a = 0.0;
+        ok = (power_read(&v, &a) == 0);
+
+        /* The meter, throttled: a synchronous 9600-baud Modbus read on the control tick is how
+         * this project once starved a fleet's PreCharge. It never drives the loop now. */
         {
-            static double mtr_v, mtr_a;
             static uint32_t mtr_at;
-            static int mtr_ok;
+            double nv = 0.0, na = 0.0;
             if (mtr_at == 0u || (t - mtr_at) >= 400u) {
-                double nv = 0.0, na = 0.0;
-                mtr_ok = (power_meter_read(1, &nv, &na) == 0);
-                if (mtr_ok) { mtr_v = nv; mtr_a = na; }
+                g_meter_ok = (power_meter_read(g_meter_ch, &nv, &na) == 0);
+                if (g_meter_ok) { g_meter_v = nv; g_meter_a = na; }
                 mtr_at = (t == 0u) ? 1u : t;
             }
-            if (mtr_ok) {
-                v = mtr_v;
-                a = mtr_a;
-                ok = 1;
-            } else {
-                ok = (power_read(&v, &a) == 0);
+            if (ok && g_meter_ok && a > 2.0 &&
+                (g_meter_v < v * 0.8 || g_meter_v > v * 1.2)) {
+                if (g_meter_mismatch++ < 3u) {
+                    printf("  WARN: modules %.1fV vs meter ch%d %.1fV at %.1fA — the two "
+                           "instruments disagree with current flowing; check the meter loop\n",
+                           v, g_meter_ch, g_meter_v, a);
+                }
             }
         }
         if (ok) {
@@ -598,6 +711,29 @@ int main(int argc, char **argv)
                 }
             }
         }
+        /* THE BOARD MUST BE THE ONE WE WERE POINTED AT, and this is checked the moment it names
+         * itself — before any authorisation, any relay, any energy. Refusing here costs a
+         * restart; not refusing costs a charge delivered to the wrong gun. */
+        if (want_mac && !mac_checked && cbctl_link_state(&link) == CBCTL_LINK_READY) {
+            cbctl_identity_t id;
+            if (cbctl_identity(&link, &id)) {
+                mac_checked = 1;
+                if (cbctl_expect_mac(&link, expect_mac) != CBCTL_OK) {
+                    printf("\nWRONG BOARD on %s: expected %02X:%02X:%02X:%02X:%02X:%02X, "
+                           "found %02X:%02X:%02X:%02X:%02X:%02X\n"
+                           "  USB order is not stable — reflashing can swap the ports. Bind the "
+                           "gun to the MAC, not the device path.\n",
+                           port, expect_mac[0], expect_mac[1], expect_mac[2], expect_mac[3],
+                           expect_mac[4], expect_mac[5], id.mac[0], id.mac[1], id.mac[2],
+                           id.mac[3], id.mac[4], id.mac[5]);
+                    bailed = 1;
+                    break;
+                }
+                printf("board confirmed: %02X:%02X:%02X:%02X:%02X:%02X\n", id.mac[0], id.mac[1],
+                       id.mac[2], id.mac[3], id.mac[4], id.mac[5]);
+            }
+        }
+
         /* AUTHORISE AS SOON AS THE LINK IS UP, AND KEEP SAYING SO.
          *
          * cbctl opens with auth = DENY and marks it dirty, because a zeroed intent must be the
@@ -900,7 +1036,18 @@ int main(int argc, char **argv)
         /* Volts at the modules, no current, and the board says the contactor we asked for is
          * NOT closed. That is a circuit that was never completed, and it is worth naming
          * rather than waiting out the SoC timeout: asked-for and actually-closed differ. */
+        /* A BLIP IS NOT A BROKEN CIRCUIT. This sampled the relay mask at one instant, so a
+         * momentary open — a session flap, a restart landing mid-session — read as "the circuit
+         * was never completed" and killed a run that was otherwise fine. The condition it is
+         * really about is the relay being open CONTINUOUSLY while we hold volts and see no
+         * current, so it now measures how long the gun has actually been open. */
+        if ((link.relay_closed_mask & g_relay_mask) == g_relay_mask) {
+            t_gun_open = 0u;
+        } else if (t_gun_open == 0u) {
+            t_gun_open = (t == 0u) ? 1u : t;
+        }
         if (!bailed && t_volts != 0u && (t - t_volts) > 20000u && a < 0.5 &&
+            t_gun_open != 0u && (t - t_gun_open) > 20000u &&
             (link.relay_closed_mask & g_relay_mask) != g_relay_mask) {
             printf("\nBAIL: %.0fV at the modules, %.1fA, but the board reports relays=0x%02X "
                    "when we asked for 0x%02X — the circuit was never completed\n",
@@ -928,14 +1075,19 @@ int main(int argc, char **argv)
         if (t - last_report >= 5000u) {
             {
                 const uint32_t fa = cbctl_feed_age_ms(&link, t);
-                double mv = 0.0, mi = 0.0;
-                const int mok = ok; mv = v; mi = a;
-                printf("       meter: %s %.1fV %.1fA\n", mok ? "ok" : "UNREADABLE", mv, mi);
-                printf("       %-11s feed=%s soc=%d tgt=%umV modules=%s %.1fV %.1fA %.0fWh "
+                /* NAME THE SOURCE. This line used to say "modules=" for a value that now comes
+                 * from the meter, and that mislabel cost a diagnosis: a meter reading the wrong
+                 * gun's loop was read as "the modules produced nothing". Say which it is, and
+                 * print the module group's own numbers beside it so the two can disagree
+                 * visibly. */
+                printf("       %-11s feed=%s soc=%d tgt=%umV %s %.1fV %.1fA %.0fWh "
+                       "| meter %s %.1fV %.1fA "
                        "led=%s relays=0x%02X | grp a=%d/act=%d/on=%d/flt=%d req=%.0fV/%.0fA | L=%u F=%u A=%u S=%u\n",
                        cbctl_flag(&link, CBCTL_FLAG_SESSION_ACTIVE) ? "session" : "waiting",
                        fa == CBCTL_FEED_NEVER_SENT ? "NEVER" : "ok",
-                       soc, link.ev_target_mv, ok ? "fresh" : "STALE", v, a, wh,
+                       soc, link.ev_target_mv,
+                       ok ? "mod" : "STALE", v, a, wh,
+                       g_meter_ok ? "ok" : "--", g_meter_v, g_meter_a,
                        cbctl_led_name(cbctl_led_preset(&link, t)), link.relay_closed_mask,
                        g_ga, g_gact, g_gon, g_gflt, g_grv, g_gra,
                        link.limits_sent, link.feedback_sent, link.auth_sent,
@@ -1013,6 +1165,16 @@ int main(int argc, char **argv)
         (void)fflush(g_diaglog);
         (void)fclose(g_diaglog);
         g_diaglog = NULL;
+    }
+
+    /* WHAT THE BOARD CONFIRMED, not what we sent. An unconfirmed declaration means the charge
+     * ran under an identity nobody applied, and that must be visible in the result rather than
+     * assumed from the fact that a setter returned OK. */
+    if (link.prov.evse_id_set || link.prov.attn_trim_set || link.prov.protocol_mask_set) {
+        printf("\n=== provisioning ===\n");
+        printf("  supported       : %s\n", cbctl_provision_supported(&link) ? "yes" : "NO");
+        printf("  confirmed       : %s\n", link.prov_dirty ? "NOT CONFIRMED BY THE BOARD" : "yes");
+        printf("  accepted/refused: %u/%u\n", link.prov_accepted, link.prov_refused);
     }
 
     printf("\n=== result ===\n");
