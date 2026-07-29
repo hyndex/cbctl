@@ -98,6 +98,20 @@ static unsigned char kModuleAddr[8] = { 1u, 2u };
  * whole of PreCharge, never saw it converge, and dropped the session. The contactor then opened
  * and re-closed on every retry — audible relay chatter whose real cause was a meter channel. */
 static int g_meter_ch = 1;
+
+/* Fleet mode (CBCTL_SIBLING_PORT). File scope because the wind-down loops below need them too;
+ * a charge that stopped servicing the sibling the moment it finished would not be modelling
+ * anything real. */
+static cbctl_serial_t g_sib_ser;
+static cbctl_link_t   g_sib_link;
+static cbctl_fleet_t  g_fleet;
+static int            g_fleet_on;
+static uint32_t       g_sib_worst_feed_gap;   /* worst gap between sibling STATUS observations */
+static uint32_t       g_sib_last_obs;
+static uint32_t       g_sib_quarantines;
+static uint32_t       g_sib_kill_s;          /* CBCTL_SIBLING_KILL_S: yank its USB mid-charge */
+static int            g_sib_killed;
+static uint32_t       g_worst_gap_after_kill; /* the charging link's worst tick gap AFTER it */
 static int g_meter_ok;
 static double g_meter_v, g_meter_a;
 static unsigned g_meter_mismatch;
@@ -387,6 +401,40 @@ int main(int argc, char **argv)
         power_off();
         return 2;
     }
+
+    /* FLEET MODE — the other gun's board sharing this one control loop.
+     *
+     * The question this exists to answer is not "does the library have a fleet API" but "does a
+     * REAL charge degrade when a second PLC is being serviced by the same thread". Everything
+     * else here is unchanged, so the run is directly comparable against a single-link baseline:
+     * same tool, same charge, same counters, one extra board on the loop.
+     *
+     * The sibling is deliberately given NO vehicle and NO relay. That is the case the operator
+     * actually has most of the time — one gun charging, one gun sitting idle — and it is the one
+     * where an idle link's STATUS polling could quietly eat the charging link's wire time. */
+    {
+        const char *sib = getenv("CBCTL_SIBLING_PORT");
+        if (sib != NULL && sib[0] != '\0') {
+            if (!cbctl_serial_open(&g_sib_ser, sib, 115200u) ||
+                cbctl_open(&g_sib_link, &g_sib_ser.tx) != CBCTL_OK) {
+                fprintf(stderr, "cannot attach sibling %s\n", sib);
+                power_off();
+                return 2;
+            }
+            cbctl_fleet_init(&g_fleet);
+            if (cbctl_fleet_add(&g_fleet, &link) != CBCTL_OK ||
+                cbctl_fleet_add(&g_fleet, &g_sib_link) != CBCTL_OK) {
+                fprintf(stderr, "cannot build fleet\n");
+                power_off();
+                return 2;
+            }
+            g_fleet_on = 1;
+            g_sib_kill_s = (uint32_t)atoi(getenv("CBCTL_SIBLING_KILL_S") ?
+                                          getenv("CBCTL_SIBLING_KILL_S") : "0");
+            printf("FLEET MODE: charging link + sibling %s on ONE loop%s\n", sib,
+                   g_sib_kill_s ? " (sibling transport will be KILLED mid-charge)" : "");
+        }
+    }
     /* AFTER cbctl_open — it zeroes the link, so a hook installed before it would vanish. */
     {
         const char *tr = getenv("CBCTL_TRACE_STATUS");
@@ -656,7 +704,39 @@ int main(int argc, char **argv)
         meas.isolation = CBCTL_ISO_VALID;   /* controller proxy — no IMD on this bench */
         (void)cbctl_set_measurement(&link, &meas);
 
-        cbctl_tick(&link, t);
+        /* ONE tick call drives both boards when a sibling is attached. cbctl_fleet_tick services
+         * every link in round-robin; it is the same code path a real controller would use. */
+        /* THE DECISIVE EVENT: the idle board's transport is pulled out from under it while THIS
+         * gun is drawing current. Everything after this point is the answer to "does cbctl ditch
+         * one PLC when someone is charging on the other" — except the roles are the harder way
+         * round, because the survivor is the one with a contactor closed and a car attached. */
+        if (g_fleet_on && g_sib_kill_s != 0u && !g_sib_killed &&
+            (t - t0) / 1000u >= g_sib_kill_s) {
+            g_sib_killed = 1;
+            printf("[%6us] *** KILLING the idle sibling's transport (models a USB drop) ***\n",
+                   (t - t0) / 1000u);
+            cbctl_serial_close(&g_sib_ser);
+        }
+        if (g_fleet_on) {
+            (void)cbctl_fleet_tick(&g_fleet, t);
+            if (g_sib_killed && link.worst_tick_gap_ms > g_worst_gap_after_kill) {
+                g_worst_gap_after_kill = link.worst_tick_gap_ms;
+            }
+            {
+                /* Watch the SIBLING's health from the charging link's own loop. If servicing a
+                 * charge ever starved the idle board, this gap is where it would show. */
+                const uint32_t obs = cbctl_observation_age_ms(&g_sib_link, t);
+                if (obs != 0xFFFFFFFFu && obs > g_sib_worst_feed_gap) {
+                    g_sib_worst_feed_gap = obs;
+                }
+                g_sib_last_obs = obs;
+                if (cbctl_link_state(&g_sib_link) == CBCTL_LINK_QUARANTINED) {
+                    g_sib_quarantines++;
+                }
+            }
+        } else {
+            cbctl_tick(&link, t);
+        }
 
         while (cbctl_next_event(&link, &ev)) {
             if (ev.kind == CBCTL_EV_VEHICLE_MAC_KNOWN) {
@@ -1101,9 +1181,19 @@ int main(int argc, char **argv)
             last_report = t;
         }
 
-        pfd.fd = cbctl_serial_fd(&ser);
-        pfd.events = POLLIN;
-        (void)poll(&pfd, 1, (int)cbctl_next_deadline_ms(&link, now_ms()));
+        /* Waiting on ONE link's fd while a second link needs servicing is how a caller ditches a
+         * PLC even though the library did nothing wrong — so poll BOTH, and wake on whichever
+         * link's deadline comes first. */
+        if (g_fleet_on) {
+            struct pollfd pf[2];
+            pf[0].fd = cbctl_serial_fd(&ser);      pf[0].events = POLLIN; pf[0].revents = 0;
+            pf[1].fd = cbctl_serial_fd(&g_sib_ser); pf[1].events = POLLIN; pf[1].revents = 0;
+            (void)poll(pf, 2, (int)cbctl_fleet_next_deadline_ms(&g_fleet, now_ms()));
+        } else {
+            pfd.fd = cbctl_serial_fd(&ser);
+            pfd.events = POLLIN;
+            (void)poll(&pfd, 1, (int)cbctl_next_deadline_ms(&link, now_ms()));
+        }
     }
 
     /* Wind down: modules off FIRST, then the session, then keep ticking so the close reaches
@@ -1145,7 +1235,8 @@ int main(int argc, char **argv)
         uint32_t pending = 0u;
         printf("draining the board's log...\n");
         while (now_ms() - d0 < 15000u) {
-            cbctl_tick(&link, now_ms());
+            if (g_fleet_on) { (void)cbctl_fleet_tick(&g_fleet, now_ms()); }
+            else { cbctl_tick(&link, now_ms()); }
             (void)poll(NULL, 0, 20);
             if (cbctl_diag_state(&link, NULL, NULL, NULL, &pending) && pending == 0u &&
                 now_ms() - d0 > 2000u) {
@@ -1191,6 +1282,21 @@ int main(int argc, char **argv)
            cbctl_counter(&link, CBCTL_CTR_RELAY_SAFETY_OPENS), link.relay_closed_mask);
     printf("  min lease headroom: %ums   worst tick gap: %ums\n",
            link.lease_min_headroom_ms, link.worst_tick_gap_ms);
+    if (g_fleet_on) {
+        /* The sibling never charged, so it has no lease to report. What matters is that it stayed
+         * READY and kept being observed while this gun drew 50 A — and, symmetrically, that the
+         * numbers above are no worse than a single-link run. */
+        printf("  sibling    : state=%s worst STATUS gap=%ums (bound %u) last=%ums "
+               "quarantined_ticks=%u\n",
+               cbctl_link_state(&g_sib_link) == CBCTL_LINK_READY ? "READY" :
+               cbctl_link_state(&g_sib_link) == CBCTL_LINK_QUARANTINED ? "QUARANTINED" : "other",
+               g_sib_worst_feed_gap, (unsigned)CBPLC_LIMITS_STALE_MS, g_sib_last_obs,
+               g_sib_quarantines);
+        if (g_sib_killed) {
+            printf("  sibling transport was KILLED at %us — this gun's worst tick gap after "
+                   "the kill: %ums\n", g_sib_kill_s, g_worst_gap_after_kill);
+        }
+    }
     printf("  transport  : deferred=%u partial=%u read_err=%u\n",
            ser.write_deferred, ser.partial_writes, ser.read_errors);
 
