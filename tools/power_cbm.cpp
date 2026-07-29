@@ -219,7 +219,19 @@ int power_open(const char *can_iface, const char *meter_dev, int meter_unit,
         cbmeter::DriverConfig cfg;
         cfg.transport = g->mtrans;
         cfg.modbus_unit = meter_unit;
-        cfg.read_timeout = std::chrono::milliseconds(1000);
+        /* SHORT ON PURPOSE — this read happens on the ONLY thread servicing either PLC.
+         *
+         * Dcm3366Driver::read() is one read_once plus, on a transient fault, a second: at the
+         * production 1000 ms deadline a DEAD meter blocks ~2.1 s, which is 1.4x
+         * CBPLC_LIMITS_STALE_MS and would drop BOTH guns' contactors at once. The driver's own
+         * recovery_read() comment prices the same hazard ("would age the healthy gun's evidence
+         * on the shared bus") and takes a sub-period deadline for it.
+         *
+         * The meter is a WITNESS here, not the control source — the modules answer the vehicle —
+         * so a deadline short enough to be irrelevant to the loop costs only a skipped
+         * corroboration. A healthy DCM3366 exchange at 9600 baud is ~30 ms; 150 ms is five times
+         * that, and bounds the worst case to ~350 ms including the in-driver retry. */
+        cfg.read_timeout = std::chrono::milliseconds(150);
         g->meter = std::make_unique<cbmeter::drivers::Dcm3366Driver>(cfg, cbmeter::drivers::Dcm3366Profile::Auto);
         (void)g->meter->probe();
     }

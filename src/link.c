@@ -780,8 +780,8 @@ static uint32_t auth_period(const cbctl_link_t *link)
         return 1000u;
     }
     p = link->auth_lease_ms / 3u;
-    if (p < 500u) {
-        p = 500u;
+    if (p < CBCTL_AUTH_PERIOD_FLOOR_MS) {
+        p = CBCTL_AUTH_PERIOD_FLOOR_MS;
     }
     if (p > 5000u) {
         p = 5000u;
@@ -1373,12 +1373,59 @@ uint32_t cbctl_next_deadline_ms(const cbctl_link_t *link, uint32_t now_ms)
         return CBCTL_FEED_PERIOD_MS;
     }
     if (link->state == CBCTL_LINK_QUARANTINED) {
-        const cbctl_age_t a = cbctl_age(link->quarantined_until, now);
+        cbctl_age_t a;
+        /* PERMANENT QUARANTINE HAS NO DEADLINE, AND ASKING FOR ONE RETURNS ZERO FOREVER.
+         *
+         * quarantine_permanent is a policy state, so nothing ever stamps quarantined_until on
+         * those paths (link.c identity-changed, fleet.c duplicate-board). The reversed-argument
+         * idiom below reads "time remaining", so an unstamped 0 computes 0 - now, clamps to 0,
+         * and this link asks to be woken immediately for the rest of the process's life. There
+         * is nothing to do for a board that is contained forever; say so with a long period. */
+        if (link->quarantine_permanent) {
+            return CBCTL_REPROBE_MS;
+        }
+        a = cbctl_age(link->quarantined_until, now);
         return (a.ms > 0) ? (uint32_t)a.ms : 0u;
     }
     if (cbplc_busy(&link->session)) {
         return 0u; /* work in flight: come straight back */
     }
+
+    /* STATUS IS DUE ON EVERY LINK. THE FEED IS DUE ONLY ON ONE THAT DECLARED AN ENVELOPE.
+     *
+     * This used to schedule purely from last_limits, which is stamped only when a LIMITS feed
+     * actually goes out. On a link that has never declared an envelope — an IDLE GUN, the most
+     * ordinary state a second connector is ever in — last_limits stays 0, the computed age is
+     * therefore enormous, and the function returned 0. Nothing then stamps it, because there is
+     * no envelope to send, so the answer stays 0 forever and the caller stops sleeping.
+     *
+     * Measured on evse-h85fw: one link 2.4% CPU, two links with the second one idle 25% — a
+     * tenfold cost for a board that was doing nothing. The direction is safe, since a spinning
+     * loop services BOTH guns more often rather than less, which is exactly why no test caught
+     * it: cbctl_next_deadline_ms is asserted only from above (CHECK(d <= 400u)).
+     *
+     * The two sibling functions already carry this guard — cbctl_feed_age_ms() returns early on
+     * !have_envelope, and the feed-late counter tests last_limits.ms != 0u — so the omission was
+     * here alone.
+     *
+     * A link that HAS declared an envelope but not yet sent it keeps returning 0, which is
+     * correct and self-limiting: the very next tick sends the feed and stamps the clock. */
+    if (!link->have_envelope) {
+        /* Nothing to feed, so there is no feed clock to schedule from — but this function is the
+         * ONLY wake-up signal a caller has, and every other periodic obligation on the link
+         * (STATUS, heartbeat, identity retry, provisioning and AUTHORIZE re-assert) still has to
+         * be reached. Do not try to compute the earliest of them here: their cadences live in
+         * the tick, each behind its own due() test, and a second copy of that arithmetic in this
+         * function is a second thing to keep in step.
+         *
+         * Return the library's base cadence instead. It is shorter than every one of those
+         * obligations and shorter than nothing at all was, so no schedule tightens or slips —
+         * the caller simply sleeps between passes rather than spinning through them. In-flight
+         * requests are already handled above by cbplc_busy(), which is what keeps the 250 ms
+         * retry ladder from being paced by this number. */
+        return CBCTL_FEED_PERIOD_MS;
+    }
+
     age = (uint32_t)cbctl_age(now, link->last_limits).ms;
     if (age >= CBCTL_FEED_PERIOD_MS) {
         return 0u;

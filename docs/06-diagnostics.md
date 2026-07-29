@@ -47,7 +47,7 @@ another low-priority message without the same treatment.
 
 `DIAG` is the case where that warning does not apply, and applying it would be actively wrong.
 cbplc is stop-and-wait: one outstanding request, and a request occupies the wire for a full
-round trip — up to `CBCTL_WORST_BLOCK_MS` (620 ms) against a 1500 ms feed bound and a lease
+round trip — up to `CBCTL_WORST_BLOCK_MS` (750 ms) against a 1500 ms feed bound and a lease
 renewing at hold/6. Spending that on log text during a charge that is *working* buys nothing.
 
 So:

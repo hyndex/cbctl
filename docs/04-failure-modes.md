@@ -16,7 +16,7 @@ firmware build `62a77ad2`, one real vehicle (`88:C9:B3:79:3F:68`), macOS host.
 |---|---|---|---|
 | 1.1 | Normal charge | feed held at **30–39 ms** against a 1500 ms bound; lease renewed at hold/6, every renewal ACK-confirmed | **measured**, 200 s live |
 | 1.2 | Controller re-declares the feed every pass | harmless — the library compares before marking dirty | **measured**; used to make LIMITS permanently due and starve the lease |
-| 1.3 | One message unanswered by the board | stop-and-wait blocks everything for the retry sequence — bounded to **620 ms** by cbctl's own timing, so the derived hold floor (1640 ms) cannot lapse | **host test** + derivation; schema defaults gave 3300 ms and made the lease unrenewable (`acks=1`) |
+| 1.3 | One message unanswered by the board | stop-and-wait blocks everything for the retry sequence — bounded to **750 ms** by cbctl's own timing (3 transmissions x a 250 ms timeout; the retry backoff is configured but never applied), so the derived hold floor (1640 ms) cannot lapse | **host test** + derivation; schema defaults gave 3300 ms and made the lease unrenewable (`acks=1`) |
 | 1.4 | Vehicle never opens a session | not a charger fault. The reference harness reports the same on this vehicle | **measured**, both stacks |
 | 1.5 | Controller process dies | the board's dead-man opens the relay | **partially verified** — see §6.1 |
 
@@ -54,7 +54,7 @@ a ceiling the rest of your process eats into, not a budget you may spend.
 | # | Cause | Intended? | Handling |
 |---|---|---|---|
 | 4.1 | Controller stops renewing (crash, hang, power loss) | **yes — this is the point** | the board opens the relay itself |
-| 4.2 | Renewal blocked behind an unanswered request | **no** | timing bounded to 620 ms; hold floored at 1130 ms (derived, not picked) |
+| 4.2 | Renewal blocked behind an unanswered request | **no** | timing bounded to 750 ms; AUTHORIZE lease floored at 1450 ms, derived from the re-assert period actually used (auth_period() clamps to a 500 ms floor, so the old lease/3 derivation did not hold for short leases and certified an unsafe 1130 ms) |
 | 4.3 | Renewal queued but never applied | **no** | the renewal clock is stamped from the **ACK**, not from queueing |
 | 4.4 | Renewal refused by a gate | **no** | the stamp is reset so it retries at once, `relay_refusals` counts it |
 | 4.5 | Wire quantisation | **no** | hold rounded UP to the 100 ms the wire carries, so the board's lease is never shorter than we believe |

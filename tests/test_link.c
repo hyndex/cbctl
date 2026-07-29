@@ -249,15 +249,47 @@ TEST(a_full_transmit_buffer_defers_instead_of_stalling)
 
 /* next_deadline is MANDATORY on every port, unlike a pollable fd. It must never invite the
  * caller to sleep past the feed period, or the library would be handing out the very
- * staleness it exists to prevent. */
-TEST(next_deadline_never_exceeds_the_feed_period)
+ * staleness it exists to prevent.
+ *
+ * It must also never invite the caller to NOT SLEEP AT ALL. This test only ever checked the
+ * upper bound, and that one-sidedness is what let a permanent zero survive: this very test
+ * never declared an envelope, so it was exercising the no-feed path and passing `d <= 400`
+ * because the answer was a constant 0. Measured cost on a Pi with a second, idle board on the
+ * loop: 2.4% CPU became 25%. A bound with no floor is half a bound. */
+TEST(next_deadline_is_bounded_at_both_ends)
 {
     cbctl_link_t link;
     cbctl_loopback_t lb;
+    cbctl_envelope_t env;
     uint32_t now = 1000u;
+    uint32_t zeros = 0u;
+    int i;
 
+    /* PART 1 — an IDLE link: no envelope, nothing to feed. This is the ordinary state of a
+     * second connector with no vehicle on it. It must still wake for STATUS, and must not ask
+     * to be woken instantly forever. */
     bring_up(&link, &lb, &now);
-    for (int i = 0; i < 20; i++) {
+    for (i = 0; i < 40; i++) {
+        const uint32_t d = cbctl_next_deadline_ms(&link, now);
+        CHECK(d <= 400u);               /* never slower than the base cadence */
+        if (d == 0u) { zeros++; }
+        round_trip(&link, &lb, &now, 137u);
+    }
+    /* Some zeros are legitimate — a request in flight means "come straight back". A link that
+     * answers 0 on EVERY pass is a busy-wait. */
+    printf("    idle link: %u/40 passes asked for an immediate wake-up\n", zeros);
+    CHECK(zeros < 40u);
+
+    /* PART 2 — the original claim, now tested against a link that actually has a feed to keep
+     * alive, which is the only link the feed-period bound was ever about. */
+    memset(&env, 0, sizeof env);
+    env.max_voltage = CBCTL_MV(500000u);
+    env.max_current = CBCTL_MA(200000u);
+    env.max_power = CBCTL_W(100000u);
+    env.power_ready = true;
+    CHECK(cbctl_set_envelope(&link, &env) == CBCTL_OK);
+
+    for (i = 0; i < 20; i++) {
         const uint32_t d = cbctl_next_deadline_ms(&link, now);
         CHECK(d <= 400u);
         round_trip(&link, &lb, &now, 137u); /* deliberately not a multiple of the period */
@@ -1543,7 +1575,7 @@ int main(void)
     RUN(a_board_that_never_answers_cannot_make_the_tick_unbounded);
     RUN(a_wedged_board_is_quarantined_and_then_re_probed);
     RUN(a_full_transmit_buffer_defers_instead_of_stalling);
-    RUN(next_deadline_never_exceeds_the_feed_period);
+    RUN(next_deadline_is_bounded_at_both_ends);
     RUN(a_relay_close_without_a_deadman_is_refused);
     RUN(an_over_long_hold_is_clamped_to_the_firmware_ceiling);
     RUN(a_held_lease_is_renewed_by_the_tick_and_never_lapses);

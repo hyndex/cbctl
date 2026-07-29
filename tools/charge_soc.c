@@ -591,14 +591,28 @@ int main(int argc, char **argv)
         a = 0.0;
         ok = (power_read(&v, &a) == 0);
 
-        /* The meter, throttled: a synchronous 9600-baud Modbus read on the control tick is how
-         * this project once starved a fleet's PreCharge. It never drives the loop now. */
+        /* The meter: bounded AND backed off, because throttling a blocking call only changes
+         * how often you block, not for how long.
+         *
+         * This runs on the one thread that services BOTH PLCs, ahead of cbctl_fleet_tick, so its
+         * worst case is time neither gun is being fed. A synchronous 9600-baud Modbus read on a
+         * control tick is how this project once starved a fleet's PreCharge; the 400 ms throttle
+         * below was mistaken for a fix for that, and it is not one. The deadline itself is now
+         * bounded in power_cbm.cpp.
+         *
+         * A DEAD meter is the case that matters: at 400 ms it would re-block on every pass and
+         * spend most of the loop's time waiting on a device that is not answering. So failures
+         * back off to kMeterDeadMs, and one success returns to the normal cadence. Losing the
+         * witness costs a corroboration line; losing the tick costs both contactors. */
         {
             static uint32_t mtr_at;
+            static uint32_t mtr_period = 400u;
+            const uint32_t kMeterDeadMs = 5000u;
             double nv = 0.0, na = 0.0;
-            if (mtr_at == 0u || (t - mtr_at) >= 400u) {
+            if (mtr_at == 0u || (t - mtr_at) >= mtr_period) {
                 g_meter_ok = (power_meter_read(g_meter_ch, &nv, &na) == 0);
-                if (g_meter_ok) { g_meter_v = nv; g_meter_a = na; }
+                if (g_meter_ok) { g_meter_v = nv; g_meter_a = na; mtr_period = 400u; }
+                else { mtr_period = kMeterDeadMs; }
                 mtr_at = (t == 0u) ? 1u : t;
             }
             if (ok && g_meter_ok && a > 2.0 &&

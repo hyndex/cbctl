@@ -56,9 +56,23 @@ extern "C" {
 #ifndef CBCTL_RETRY_LIMIT
 #define CBCTL_RETRY_LIMIT 2u
 #endif
-/* Longest one unanswered request can block every other message. */
+/* Longest one unanswered request can block every other message.
+ *
+ * MEASURED FROM THE SESSION, NOT ASSUMED. The obvious reading of "2 retries at 250 ms plus
+ * 60 ms of backoff" gives 620, and it is wrong twice:
+ *
+ *   1. RETRY_LIMIT is a retry count, not a transmission count. cbplc retries while
+ *      `attempts <= retry_limit` with attempts starting at 1 (session.c), so a limit of 2 sends
+ *      the request THREE times and therefore waits out THREE timeouts.
+ *   2. The backoff is never applied. restage_for_retry() sets pending_since = now_ms with no
+ *      backoff term, and `retry_backoff_ms` is written (here and in session.c's defaults) but
+ *      read nowhere in either tree. Adding it to the budget counts time that is never spent.
+ *
+ * The two errors point in opposite directions and very nearly cancelled, which is why 620
+ * survived: the real figure is 750. Everything derived from this constant was sized against a
+ * budget 130 ms short of the truth. */
 #define CBCTL_WORST_BLOCK_MS \
-    (CBCTL_RETRY_LIMIT * (CBCTL_REQUEST_TIMEOUT_MS + CBCTL_RETRY_BACKOFF_MS))
+    ((CBCTL_RETRY_LIMIT + 1u) * CBCTL_REQUEST_TIMEOUT_MS)
 /* HOW MANY RENEWALS FIT INSIDE ONE HOLD.
  *
  * Six, not three. The dead-man exists to catch a controller that has DIED; a controller that
@@ -118,12 +132,32 @@ extern "C" {
 #define CBCTL_EV_TARGET_STALE_MS 6000u
 #endif
 
+/* The floor auth_period() clamps the AUTHORIZE re-assert period to. Named here because
+ * CBCTL_AUTH_LEASE_MIN_SAFE_MS is derived from it, and a floor that drifts away from the
+ * constant derived from it is how the old derivation silently stopped being true. */
+#ifndef CBCTL_AUTH_PERIOD_FLOOR_MS
+#define CBCTL_AUTH_PERIOD_FLOOR_MS 500u
+#endif
+
 /* Shortest AUTHORIZE lease that cannot be lapsed by one unanswered request, derived from the
  * same blocking budget as the relay hold. Refused rather than raised: unlike a relay hold —
  * where a longer dead-man is merely less safe and silently raising it keeps the contactor
  * governed — an authorisation lease is a policy decision the caller owns, and quietly
  * lengthening it would grant more permission than was asked for. */
-#define CBCTL_AUTH_LEASE_MIN_SAFE_MS ((CBCTL_WORST_BLOCK_MS * 3u) / 2u + 200u)
+/* Derived from the RE-ASSERT PERIOD ACTUALLY USED, which is not lease/3 for a short lease.
+ *
+ * The old form assumed AUTHORIZE re-asserts at lease/3, making (3/2)x the block budget the
+ * requirement. But auth_period() floors the period at CBCTL_AUTH_PERIOD_FLOOR_MS, so every
+ * lease below 3x the floor re-asserts at the floor instead — and the constant was accepting
+ * leases in exactly that range. Worked through at the old value: a 1130 ms lease re-asserts at
+ * 500 ms, one blocked request adds the worst block, and the gap reaches 500 + 750 = 1250 ms
+ * against an 1130 ms lease. The board demotes GRANTED to PENDING on expiry and a live charge
+ * ends with auth_withdrawn — from a lease the library had certified as safe.
+ *
+ * State the real requirement instead of a ratio that only holds above the floor: one re-assert
+ * period, plus one worst-case block, plus margin. */
+#define CBCTL_AUTH_LEASE_MIN_SAFE_MS \
+    (CBCTL_AUTH_PERIOD_FLOOR_MS + CBCTL_WORST_BLOCK_MS + 200u)
 
 /* How many times the board may undo a close we are holding before cbctl gives up on it.
  *
