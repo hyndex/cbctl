@@ -120,36 +120,27 @@ static void on_message(void *user, const cbplc_msg_t *msg, cbplc_err_t status)
         if (link->restart_inflight) {
             link->restart_inflight = false;
         }
-        /* A relay ACK is the only proof the lease was actually extended. Re-stamp from it so
-         * the renewal clock measures APPLIED renewals, not attempted ones. */
+        /* A LOST RENEWAL IS NEITHER AN ACK NOR A REFUSAL, AND THERE IS NO MESSAGE TO READ.
+         *
+         * `status != CBPLC_E_OK` means the session had nothing to hand us: every non-OK delivery
+         * in cbplc/src/session.c passes NULL (:211 transport, :233/:348 timeout, :253, :306), and
+         * the only deliveries carrying a message are CBPLC_E_OK. So classifying the ACK here by
+         * reading msg->payload — which the block on the OK path below does, correctly — is an
+         * unconditional NULL dereference on the one path whose whole job is to handle loss.
+         *
+         * relay_ack_pending is armed by every lease renewal, so the trigger is "a gun is holding
+         * its contactor closed and the board goes quiet": a USB re-enumeration, a WDT reset, a
+         * CDC wedge. Those are the most common real faults on this hardware, and this crashed the
+         * process — which on a two-link host takes the OTHER gun's link down with it and drops a
+         * contactor that was carrying current.
+         *
+         * Clear the flag so the path cannot wedge, and account nothing, because we did not learn
+         * whether the lease was extended. Deliberately NOT re-stamping last_relay is the safe
+         * direction: the lease stays unproven, relay_in_danger() keeps pressing, and the renewal
+         * is retried rather than the clock being advanced by one that may never have landed. The
+         * loss itself is already counted by consecutive_losses below. */
         if (link->relay_ack_pending) {
             link->relay_ack_pending = false;
-            if ((msg->payload_len == 0u) || (msg->payload[0] == 0u)) {
-                link->last_relay = cbctl_instant(link->session.last_now_ms);
-                link->relay_acks++;
-                link->relay_refusal_streak = 0u;
-            } else {
-                /* Refused: the lease was NOT extended.
-                 *
-                 * Retrying AT ONCE is right for a transient gate and ruinous for a standing one.
-                 * cbplc refuses a gun close while authorisation is not yet live (`auth=0`), which
-                 * can persist for seconds — and this path retried every tick for as long as it
-                 * lasted. Measured on hardware: 2509 refusals in one run, 125 in a 10 s window.
-                 * On a stop-and-wait wire those retries crowd out the AUTHORIZE renewal that is
-                 * the very thing that would clear the refusal, so the loop sustains itself.
-                 *
-                 * So: retry immediately a couple of times — a genuinely transient gate clears
-                 * there — then fall back to the ordinary renewal cadence, which still re-attempts
-                 * the close forever, just without starving the link that has to carry the fix.
-                 * Any ACK clears the streak. */
-                link->relay_refusals++;
-                if (link->relay_refusal_streak < CBCTL_RELAY_REFUSAL_FAST_RETRIES) {
-                    link->last_relay = cbctl_instant(0u);
-                }
-                if (link->relay_refusal_streak < 0xFFFFFFFFu) {
-                    link->relay_refusal_streak++;
-                }
-            }
         }
         if (link->op_on_wire && link->op_state == CBCTL_OP_PENDING) {
             link->op_state = CBCTL_OP_LOST;

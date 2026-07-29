@@ -637,6 +637,75 @@ TEST(one_unanswered_message_cannot_lapse_the_relay_lease)
     CHECK(worst_gap < hold);
 }
 
+/* A LOST LEASE RENEWAL MUST NOT CRASH THE PROCESS.
+ *
+ * The reply path checks `status` before `msg`, which is right — the session reports a timed-out
+ * request as deliver(NULL, CBPLC_E_TIMEOUT), so checking msg first would swallow every loss. But
+ * the error branch then went on to classify the relay ACK by reading msg->payload, and on that
+ * branch msg is ALWAYS NULL: every non-OK delivery in cbplc/src/session.c passes NULL.
+ *
+ * relay_ack_pending is armed by every lease renewal, so the trigger was "a contactor is held
+ * closed and the board stops answering RELAY" — a USB re-enumeration, a WDT reset, a CDC wedge.
+ * Those are the ordinary faults on this hardware. It segfaulted the whole process, and on a
+ * two-link host that takes the OTHER gun down with it and drops a contactor carrying current.
+ *
+ * The previous deaf-board test swallowed STATUS, which never arms relay_ack_pending, so it
+ * walked straight past this. Swallowing RELAY is what reaches it. Without the fix this test does
+ * not fail an assertion — it dies with SIGSEGV, which is the point. */
+TEST(a_lost_relay_renewal_does_not_crash_or_forge_an_ack)
+{
+    cbctl_link_t link;
+    cbctl_loopback_t lb;
+    uint32_t now = 1000u;
+    uint32_t acks_before, renewals_before;
+
+    bring_up(&link, &lb, &now);
+    CHECK(cbctl_relay_close(&link, CBPLC_RELAY_GUN, 3000u, NULL) == CBCTL_OK);
+
+    /* Let the lease establish normally first, so we are testing loss of a RENEWAL on a held
+     * contactor rather than a close that never landed. */
+    for (int i = 0; i < 40; i++) {
+        round_trip(&link, &lb, &now, 100u);
+    }
+    CHECK(link.relay_acks > 0u);
+    acks_before = link.relay_acks;
+    renewals_before = link.relay_renewals;
+
+    /* Now the board stops servicing RELAY specifically, while the rest of it stays alive. */
+    lb.swallow_type = (uint8_t)CBPLC_T_RELAY;
+
+    for (int i = 0; i < 200; i++) {
+        round_trip(&link, &lb, &now, 100u);
+    }
+
+    printf("    renewals %u->%u  acks %u->%u  refusals=%u\n", renewals_before,
+           link.relay_renewals, acks_before, link.relay_acks, link.relay_refusals);
+
+    /* Survived at all — no NULL dereference on the loss path. */
+
+    /* A renewal that was never answered is NOT an ACK. Forging one here would be worse than the
+     * crash: it would advance the renewal clock on a lease the board never extended, so the
+     * controller would believe a contactor was held while the board was about to drop it. */
+    CHECK(link.relay_acks == acks_before);
+
+    /* Nor is it a refusal — the board never refused, it said nothing. Counting it would trip the
+     * fast-retry backoff that exists for a genuinely refused close. */
+    CHECK(link.relay_refusals == 0u);
+
+    /* And the loss path was genuinely exercised rather than the test quietly proving nothing:
+     * renewals kept going out and not one of them came back confirmed. That pair — attempted up,
+     * confirmed flat — IS the "lease unproven" state the fix is there to represent honestly.
+     * (consecutive_losses is no use here: every good STATUS resets it, link.c:345.) */
+    CHECK(link.relay_renewals > renewals_before);
+
+    /* And the path did not wedge: with the board answering again, renewals resume. */
+    lb.swallow_type = 0u;
+    for (int i = 0; i < 60; i++) {
+        round_trip(&link, &lb, &now, 100u);
+    }
+    CHECK(link.relay_acks > acks_before);
+}
+
 /* A hold too short to survive one unanswered request is RAISED, not honoured literally. */
 TEST(an_unrenewable_hold_is_raised_to_a_safe_floor)
 {
@@ -1517,6 +1586,7 @@ int main(void)
     RUN(an_out_of_schema_evse_id_never_reaches_the_wire);
     RUN(a_firmware_that_predates_provisioning_is_detected_not_argued_with);
     RUN(a_swallowed_provision_reply_is_retried_then_bounded);
+    RUN(a_lost_relay_renewal_does_not_crash_or_forge_an_ack);
     RUN(restart_is_refused_while_holding_a_contactor);
     RUN(a_board_that_refuses_a_restart_reports_the_gate);
     if (g_fail) {

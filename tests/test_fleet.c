@@ -234,6 +234,71 @@ TEST(f5_one_links_quarantine_does_not_disturb_anothers_relay_lease)
     CHECK(r.link[0].relay_renewals > renewals_before + 5u);
 }
 
+/* F6 — THE MIRROR OF F5, AND THE ONE THAT WAS MISSING.
+ *
+ * F5 wedges the IDLE board while the OTHER holds a contactor. Every multi-link test in this file
+ * is shaped that way: the fault always lands on the link that is not carrying current. That left
+ * the opposite arrangement — the board that is ITSELF holding a closed contactor goes silent —
+ * with no coverage at all, and it is the more common field event: a gun mid-charge is precisely
+ * the gun whose USB is loaded, whose PLC is busiest, and whose board re-enumerates or WDT-resets.
+ *
+ * It is also the arrangement that used to take the whole process down. A lease renewal is
+ * answered by nothing, the session delivers (NULL, CBPLC_E_TIMEOUT), and the reply path
+ * dereferenced that NULL while classifying the relay ACK. In one process driving two links, that
+ * is not a gun-0 problem — it is a SIGSEGV, so gun 1's link stops ticking too, its feed goes
+ * stale past CBPLC_LIMITS_STALE_MS, and its board drops a contactor that was carrying current.
+ * One gun's fault taking the other gun's charge down is the exact property this file exists to
+ * deny, so it is asserted here rather than left to the single-link suite. */
+TEST(f6_a_fault_on_the_link_holding_the_contactor_spares_the_other)
+{
+    static rig_t r;
+    uint32_t sibling_limits_before, worst_sibling_age = 0u;
+    int i;
+
+    rig_up(&r);
+    /* Both guns charging at once — the real dual-gun steady state, which nothing else covers. */
+    CHECK(cbctl_relay_close(&r.link[0], CBPLC_RELAY_GUN, 3000u, NULL) == CBCTL_OK);
+    CHECK(cbctl_relay_close(&r.link[1], CBPLC_RELAY_GUN, 3000u, NULL) == CBCTL_OK);
+    for (i = 0; i < 10; i++) {
+        rig_round(&r, 200u);
+    }
+    CHECK(r.link[0].relay_acks > 0u);
+    CHECK(r.link[1].relay_acks > 0u);
+    sibling_limits_before = r.link[1].limits_sent;
+
+    /* The board that is HOLDING THE CLOSED CONTACTOR goes silent. */
+    r.lb[0].wedged = true;
+
+    for (i = 0; i < 200; i++) {
+        rig_round(&r, 200u);
+        if (cbctl_link_state(&r.link[1]) == CBCTL_LINK_READY) {
+            const uint32_t age = cbctl_feed_age_ms(&r.link[1], r.now);
+            if (age != CBCTL_FEED_NEVER_SENT && age > worst_sibling_age) {
+                worst_sibling_age = age;
+            }
+        }
+    }
+
+    printf("    gun0 wedged while holding; gun1 worst feed age=%ums (bound %u) acks=%u\n",
+           worst_sibling_age, (unsigned)CBPLC_LIMITS_STALE_MS, r.link[1].relay_acks);
+
+    /* Survived — no NULL dereference on the dead link's loss path. */
+
+    /* The dead gun is contained. */
+    CHECK(cbctl_link_state(&r.link[0]) == CBCTL_LINK_QUARANTINED);
+
+    /* THE CLAIM: the surviving gun never noticed. Its feed stayed inside the deadline the BOARD
+     * opens a relay at, so its contactor was never at risk. */
+    CHECK(worst_sibling_age < CBPLC_LIMITS_STALE_MS);
+    CHECK(cbctl_link_state(&r.link[1]) == CBCTL_LINK_READY);
+    CHECK(r.link[1].limits_sent > sibling_limits_before);
+
+    /* And its lease kept being CONFIRMED, not merely attempted — the distinction that decides
+     * whether a contactor is actually still held. */
+    CHECK(r.link[1].relay_acks > 0u);
+    CHECK(r.link[1].relay_refusals == 0u);
+}
+
 /* A duplicate link would be serviced twice per tick, doubling its own feed and halving
  * everyone else's share of the quantum. */
 TEST(a_duplicate_link_is_refused)
@@ -324,6 +389,7 @@ int main(void)
     RUN(f3_work_per_tick_stays_bounded_under_a_flood);
     RUN(f4_no_link_is_starved_by_its_position_in_the_array);
     RUN(f5_one_links_quarantine_does_not_disturb_anothers_relay_lease);
+    RUN(f6_a_fault_on_the_link_holding_the_contactor_spares_the_other);
     RUN(a_duplicate_link_is_refused);
     RUN(the_fleet_deadline_is_the_nearest_one_and_is_never_too_long);
     RUN(a_dead_transport_is_quarantined_and_the_sibling_is_untouched);
