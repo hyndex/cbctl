@@ -522,6 +522,7 @@ typedef struct {
     uint32_t relay_acks;     /* renewals the board CONFIRMED — the number that matters */
     uint32_t relay_refusals; /* renewals the board refused (a gate held) */
     uint32_t relay_refusal_streak; /* consecutive refusals; retry-at-once is capped by this */
+    uint32_t auth_danger_preempts; /* AUTHORIZE re-asserts that jumped the feed to save a lease */
     bool     relay_ack_pending;
     uint32_t relay_safety_base;   /* safety-open count when the close intent was established */
     bool     relay_base_valid;

@@ -738,6 +738,113 @@ TEST(a_lost_relay_renewal_does_not_crash_or_forge_an_ack)
     CHECK(link.relay_acks > acks_before);
 }
 
+/* THE CALLER'S PASS RATE IS A SAFETY PARAMETER, AND NOTHING SAID SO.
+ *
+ * issue_one() is a first-match-wins chain: every branch returns, so whichever obligation
+ * matches first consumes the tick's single acked slot. FEEDBACK sits ABOVE the ordinary relay
+ * renewal, AUTHORIZE, HEARTBEAT and STATUS, and it is due whenever the measurement is dirty or
+ * CBCTL_FEED_PERIOD_MS has passed. So as the caller's pass approaches the feed period, FEEDBACK
+ * becomes due on every tick and everything below it is squeezed out.
+ *
+ * That matters because two of the squeezed obligations OPEN CONTACTORS when they lapse. The
+ * relay renewal has an escape — the danger preempt at hold/2 sits above FEEDBACK. AUTHORIZE has
+ * none: it is re-asserted purely on its own period, from a position below FEEDBACK, and when the
+ * board's lease expires it demotes GRANTED to PENDING and drops the energy relays.
+ *
+ * The failure is silent by construction. cbctl_tick() keeps returning CBCTL_OK, the feed stays
+ * fresh so feed_late stays 0, the link stays READY, and the board sees a perfectly healthy
+ * controller — right up until the authorisation lease runs out mid-charge.
+ *
+ * This sweeps the pass rate and asserts each obligation still gets serviced inside its own
+ * deadline. It needs no vehicle and no second board, which is the point: the variable that
+ * matters is the caller's cadence, not the gun count. */
+TEST(every_obligation_survives_a_slow_caller)
+{
+    static const uint32_t kPasses[] = { 100u, 200u, 400u, 600u, 1000u, 1500u, 2000u };
+    unsigned p;
+
+    for (p = 0; p < sizeof kPasses / sizeof kPasses[0]; p++) {
+        cbctl_link_t link;
+        cbctl_loopback_t lb;
+        cbctl_envelope_t env;
+        cbctl_measurement_t m;
+        uint32_t now = 1000u;
+        const uint32_t step = kPasses[p];
+        const uint32_t lease = 8000u;
+        uint32_t auth_before, auth_at_start, acks_before, worst_hb_age = 0u;
+        uint32_t worst_auth_gap = 0u, last_auth_at = 0u;
+        int i;
+        const int rounds = (int)(60000u / step);   /* 60 s of modelled time per row */
+
+        bring_up(&link, &lb, &now);
+
+        memset(&env, 0, sizeof env);
+        env.max_voltage = CBCTL_MV(500000u);
+        env.max_current = CBCTL_MA(200000u);
+        env.max_power = CBCTL_W(100000u);
+        env.power_ready = true;
+        CHECK(cbctl_set_envelope(&link, &env) == CBCTL_OK);
+        CHECK(cbctl_authorize(&link, CBCTL_AUTH_GRANTED, lease) == CBCTL_OK);
+        CHECK(cbctl_relay_close(&link, CBPLC_RELAY_GUN, 10000u, NULL) == CBCTL_OK);
+
+        /* Settle, then measure only the steady state. */
+        for (i = 0; i < 20; i++) {
+            round_trip(&link, &lb, &now, step);
+        }
+        auth_before = link.auth_sent;
+        auth_at_start = link.auth_sent;
+        acks_before = link.relay_acks;
+        last_auth_at = now;
+
+        for (i = 0; i < rounds; i++) {
+            /* A REAL caller re-states its measurement every pass, because the vehicle's voltage
+             * and current genuinely move. That is what makes FEEDBACK due continuously. */
+            memset(&m, 0, sizeof m);
+            m.present_voltage = CBCTL_MV(370000u + (uint32_t)(i % 50) * 10u);
+            m.present_current = CBCTL_MA(50000u + (uint32_t)(i % 40) * 10u);
+            m.isolation = CBCTL_ISO_VALID;
+            (void)cbctl_set_measurement(&link, &m);
+
+            round_trip(&link, &lb, &now, step);
+
+            {
+                const uint32_t hb_age = now - link.last_heartbeat.ms;
+                if (hb_age > worst_hb_age) { worst_hb_age = hb_age; }
+            }
+            if (link.auth_sent > auth_before) {
+                const uint32_t gap = now - last_auth_at;
+                if (gap > worst_auth_gap) { worst_auth_gap = gap; }
+                last_auth_at = now;
+                auth_before = link.auth_sent;
+            }
+        }
+
+        printf("    pass=%3ums  auth=%-4u relay_acks=%-4u worst auth gap=%-5ums worst hb "
+               "age=%-6ums (lease %ums)\n", step, link.auth_sent,
+               link.relay_acks - acks_before, worst_auth_gap, worst_hb_age, lease);
+
+        /* THE CLAIM: the authorisation lease is re-asserted inside its own lifetime, at every
+         * pass rate. A gap wider than the lease is the board dropping the contactor. */
+        CHECK(worst_auth_gap < lease);
+        /* And the lease the contactor actually hangs on kept being CONFIRMED. */
+        CHECK(link.relay_acks > acks_before);
+        /* AUTHORISATION WAS ACTUALLY RE-ASSERTED, not merely "never seen to be late".
+         *
+         * worst_auth_gap stays 0 when auth_sent never advances, so checking only the gap passes
+         * loudest exactly where the failure is total. That is the same sentinel-as-zero lie that
+         * made live_dual report a healthy link as stale, and it has to be excluded at every site
+         * rather than reasoned about once. */
+        CHECK(link.auth_sent > auth_at_start);
+
+        /* The HEARTBEAT message is deliberately NOT asserted on. It is squeezed out entirely
+         * above ~1000 ms, and that is harmless: cbplc's stamp_heartbeat() runs on LIMITS and on
+         * FEEDBACK too (src/app/main.cpp:1085 and :1097), so controller liveness is carried by
+         * the feed. The dedicated message is a belt for a link with nothing else to say. Worst
+         * observed age is printed so a change in that relationship is visible. */
+        (void)worst_hb_age;
+    }
+}
+
 /* A hold too short to survive one unanswered request is RAISED, not honoured literally. */
 TEST(an_unrenewable_hold_is_raised_to_a_safe_floor)
 {
@@ -1618,6 +1725,7 @@ int main(void)
     RUN(an_out_of_schema_evse_id_never_reaches_the_wire);
     RUN(a_firmware_that_predates_provisioning_is_detected_not_argued_with);
     RUN(a_swallowed_provision_reply_is_retried_then_bounded);
+    RUN(every_obligation_survives_a_slow_caller);
     RUN(a_lost_relay_renewal_does_not_crash_or_forge_an_ack);
     RUN(restart_is_refused_while_holding_a_contactor);
     RUN(a_board_that_refuses_a_restart_reports_the_gate);

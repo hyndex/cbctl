@@ -748,6 +748,36 @@ static uint32_t relay_period(const cbctl_link_t *link)
  *
  * Measured against the last CONFIRMED renewal, not the last attempt — an attempt that was
  * never applied is exactly the case this is here to survive. */
+/* AN AUTHORISATION LEASE ABOUT TO LAPSE IS THE SAME EMERGENCY AS A RELAY LEASE.
+ *
+ * It reads as a lesser obligation because the ordinary re-assert sits low in the send order, but
+ * its consequence is identical: when cbplc's lease expires the board demotes GRANTED to PENDING
+ * and opens the energy relays, and every later close is refused until a fresh grant lands. It was
+ * the only obligation with that severity and NO escape from the ordering — the relay has this
+ * preempt, STATUS has its starve promotion, the feed is unacked and effectively free, and
+ * AUTHORIZE had nothing.
+ *
+ * Measured before this existed, one link, 60 s per row, real loopback: the ordinary re-assert
+ * degrades gracefully to a caller pass of about 1500 ms (worst gap 6000 ms against an 8000 ms
+ * lease) and then stops entirely — at 2000 ms, auth_sent did not advance once in 60 s while
+ * cbctl_tick() returned CBCTL_OK, the feed stayed fresh and the link stayed READY. A silent
+ * cliff, four times slower than the documented 200 ms cadence but a cliff nonetheless.
+ *
+ * Same shape as relay_in_danger(), and same reasoning for half the lease: it leaves a full
+ * retry ladder plus margin. It can never displace the feed in steady state because it only
+ * arms once the lease is already half spent, which the ordinary re-assert at lease/3 has
+ * normally prevented. */
+static bool auth_in_danger(const cbctl_link_t *link, cbctl_instant_t now)
+{
+    uint32_t age;
+    if (link->auth != CBCTL_AUTH_GRANTED || link->auth_lease_ms == 0u ||
+        link->last_auth.ms == 0u) {
+        return false;
+    }
+    age = (uint32_t)cbctl_age(now, link->last_auth).ms;
+    return age >= (link->auth_lease_ms / CBCTL_RELAY_DANGER_DIVISOR);
+}
+
 static bool relay_in_danger(const cbctl_link_t *link, cbctl_instant_t now)
 {
     uint32_t age;
@@ -877,6 +907,21 @@ static bool issue_one(cbctl_link_t *link, cbctl_instant_t now)
             link->relay_dirty = false;
             link->relay_renewals++;
             link->relay_danger_preempts++;
+            return true;
+        }
+        return false;
+    }
+
+    /* An authorisation lease past half its life outranks the feed, for the same reason the
+     * relay lease does: losing it opens the contactor, and a feed repeat one tick late does not. */
+    if (auth_in_danger(link, now)) {
+        n = cbplc_auth_encode(CBPLC_AUTH_GRANTED, link->auth_lease_ms, buf, sizeof buf);
+        if (n > 0u && cbplc_request(&link->session, CBPLC_T_AUTHORIZE, buf, (uint16_t)n,
+                                    now.ms, &id) == CBPLC_E_OK) {
+            link->last_auth = now;
+            link->auth_dirty = false;
+            link->auth_sent++;
+            link->auth_danger_preempts++;
             return true;
         }
         return false;
