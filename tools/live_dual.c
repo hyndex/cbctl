@@ -159,10 +159,19 @@ int main(int argc, char **argv)
             }
         }
 
+        /* CBCTL_FEED_NEVER_SENT IS NOT AN AGE, AND FOLDING IT INTO A MAXIMUM IS THE LIE THE
+         * SENTINEL EXISTS TO PREVENT.
+         *
+         * cbctl_feed_age_ms() returns 0xFFFFFFFF until a feed has actually gone out — precisely
+         * so "never declared" cannot be mistaken for "perfectly fresh", which is a bug this
+         * library already shipped once. Taking a max over it makes the opposite mistake: this
+         * tool reported worst_feed=4294967295 and failed its own gate with "feed went stale" on
+         * a run where both links were healthy and the summary lines said feed=0ms and 396ms.
+         * A sentinel has to be excluded from arithmetic at every site, not just defined. */
         for (i = 0; i < NLINK; i++) {
             if (cbctl_link_state(&link[i]) == CBCTL_LINK_READY) {
                 const uint32_t age = cbctl_feed_age_ms(&link[i], t);
-                if (age > worst_feed[i]) {
+                if (age != CBCTL_FEED_NEVER_SENT && age > worst_feed[i]) {
                     worst_feed[i] = age;
                 }
             }
@@ -177,7 +186,7 @@ int main(int argc, char **argv)
         /* After the kill, gun0's feed age is the whole question. */
         if (killed && cbctl_link_state(&link[0]) == CBCTL_LINK_READY) {
             const uint32_t a = cbctl_feed_age_ms(&link[0], t);
-            if (a > worst_feed_after_kill) {
+            if (a != CBCTL_FEED_NEVER_SENT && a > worst_feed_after_kill) {
                 worst_feed_after_kill = a;
             }
         }
@@ -279,7 +288,11 @@ int main(int argc, char **argv)
         if (killed && i == 1) {
             continue; /* deliberately destroyed; it is the SURVIVOR that is on trial */
         }
-        if (worst_feed[i] >= CBPLC_LIMITS_STALE_MS) {
+        if (worst_feed[i] == 0u && link[i].limits_sent == 0u) {
+            /* Nothing was ever declared on this link, so there is no feed to judge. Reporting
+             * that as a pass would be the same sentinel confusion in the other direction. */
+            printf("  note: gun%d never had an envelope declared — feed not exercised\n", i);
+        } else if (worst_feed[i] >= CBPLC_LIMITS_STALE_MS) {
             printf("  GATE: gun%d feed went stale (%u)\n", i, worst_feed[i]);
             errors++;
         }
