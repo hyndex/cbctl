@@ -69,7 +69,10 @@ static void rig_round(rig_t *r, uint32_t step)
     r->now += step;
 }
 
-static void rig_up(rig_t *r)
+/* rig_up_n charges only the first `n_charging` links; the rest identify and stay genuinely idle
+ * — no envelope declared at all, which is what an unplugged gun looks like. rig_up keeps its old
+ * meaning (every link charging) so no existing test changes behaviour. */
+static void rig_up_n(rig_t *r, int n_charging)
 {
     int i;
     memset(r, 0, sizeof *r);
@@ -90,11 +93,18 @@ static void rig_up(rig_t *r)
     }
     for (i = 0; i < N; i++) {
         CHECK(cbctl_link_state(&r->link[i]) == CBCTL_LINK_READY);
-        charge_like(&r->link[i]);
+        if (i < n_charging) {
+            charge_like(&r->link[i]);
+        }
     }
     for (i = 0; i < 6; i++) {
         rig_round(r, 200u);
     }
+}
+
+static void rig_up(rig_t *r)
+{
+    rig_up_n(r, N);
 }
 
 /* F1 + F5 — THE ONE THAT MATTERS.
@@ -299,6 +309,93 @@ TEST(f6_a_fault_on_the_link_holding_the_contactor_spares_the_other)
     CHECK(r.link[1].relay_refusals == 0u);
 }
 
+/* F7 — DOES A SECOND (AND THIRD) CHARGING GUN COST THE FIRST ONE ANYTHING?
+ *
+ * This is the question a two-gun charger is actually bought on, and until now nothing answered
+ * it. F1 has three links charging but asserts only that a DEAD board spares the others. F6
+ * holds two leases but exists to catch a crash. Neither measures what a HEALTHY second gun costs
+ * a healthy first one, which is the number that decides whether the design scales.
+ *
+ * So measure the same link twice: once as the only gun drawing, once with every gun drawing, and
+ * compare. The claim is not "the margins are adequate" — that would pass on a design that
+ * degrades badly but started with slack. The claim is that the numbers DO NOT MOVE, because each
+ * gun has its own USB device and its own stop-and-wait session, so nothing about link 0's wire
+ * is shared with link 1's. Only CPU time in the loop is shared, and that is microseconds.
+ *
+ * If this ever fails, the fleet has acquired a shared resource it did not have, and the
+ * single-loop design needs revisiting. That is worth a test on its own. */
+TEST(f7_more_charging_guns_do_not_cost_the_first_gun_margin)
+{
+    static rig_t r;
+    uint32_t solo_feed = 0u, solo_renew_gap = 0u;
+    uint32_t all_feed = 0u, all_renew_gap = 0u;
+    uint32_t last_ack_at, hold;
+    int i, k;
+
+    /* ---- PART 1: link 0 is the ONLY gun charging. ---- */
+    rig_up_n(&r, 1);   /* only gun 0 declares anything; 1 and 2 are unplugged guns */
+    CHECK(cbctl_relay_close(&r.link[0], CBPLC_RELAY_GUN, 3000u, NULL) == CBCTL_OK);
+    hold = r.link[0].relay_hold_ms;
+    last_ack_at = 0u;
+    for (i = 0; i < 300; i++) {
+        rig_round(&r, 100u);
+        {
+            const uint32_t age = cbctl_feed_age_ms(&r.link[0], r.now);
+            if (age != CBCTL_FEED_NEVER_SENT && age > solo_feed) { solo_feed = age; }
+        }
+        if (r.link[0].relay_acks > 0u && r.link[0].last_relay.ms != last_ack_at) {
+            if (last_ack_at != 0u) {
+                const uint32_t g = r.link[0].last_relay.ms - last_ack_at;
+                if (g > solo_renew_gap) { solo_renew_gap = g; }
+            }
+            last_ack_at = r.link[0].last_relay.ms;
+        }
+    }
+
+    /* ---- PART 2: EVERY gun charging, same link measured. ---- */
+    rig_up(&r);
+    for (k = 0; k < N; k++) {
+        CHECK(cbctl_relay_close(&r.link[k], CBPLC_RELAY_GUN, 3000u, NULL) == CBCTL_OK);
+        r.lb[k].secc_active = true;   /* a live session, not just a lease */
+    }
+    last_ack_at = 0u;
+    for (i = 0; i < 300; i++) {
+        rig_round(&r, 100u);
+        {
+            const uint32_t age = cbctl_feed_age_ms(&r.link[0], r.now);
+            if (age != CBCTL_FEED_NEVER_SENT && age > all_feed) { all_feed = age; }
+        }
+        if (r.link[0].relay_acks > 0u && r.link[0].last_relay.ms != last_ack_at) {
+            if (last_ack_at != 0u) {
+                const uint32_t g = r.link[0].last_relay.ms - last_ack_at;
+                if (g > all_renew_gap) { all_renew_gap = g; }
+            }
+            last_ack_at = r.link[0].last_relay.ms;
+        }
+    }
+
+    printf("    gun0 alone : feed<=%ums  confirmed-renewal gap<=%ums\n", solo_feed, solo_renew_gap);
+    printf("    %d charging: feed<=%ums  confirmed-renewal gap<=%ums  (hold %ums, stale %u)\n",
+           N, all_feed, all_renew_gap, hold, (unsigned)CBPLC_LIMITS_STALE_MS);
+
+    /* Every gun kept its own lease confirmed, not merely attempted. */
+    for (k = 0; k < N; k++) {
+        CHECK(cbctl_link_state(&r.link[k]) == CBCTL_LINK_READY);
+        CHECK(r.link[k].relay_acks > 10u);
+        CHECK(r.link[k].relay_refusals == 0u);
+        CHECK(cbctl_counter(&r.link[k], CBCTL_CTR_RELAY_LEASE_OPENS) == 0u);
+    }
+
+    /* THE CLAIM: gun count does not move the numbers. Not "still under the limit" — UNCHANGED.
+     * One tick of slack (the rig steps 100 ms) is the tolerance; anything systematic exceeds it. */
+    CHECK(all_feed <= solo_feed + 100u);
+    CHECK(all_renew_gap <= solo_renew_gap + 100u);
+
+    /* And both are far inside the deadlines, so the margin is real and not merely non-negative. */
+    CHECK(all_feed * 3u < CBPLC_LIMITS_STALE_MS);
+    CHECK(all_renew_gap * 2u < hold);
+}
+
 /* A duplicate link would be serviced twice per tick, doubling its own feed and halving
  * everyone else's share of the quantum. */
 TEST(a_duplicate_link_is_refused)
@@ -390,6 +487,7 @@ int main(void)
     RUN(f4_no_link_is_starved_by_its_position_in_the_array);
     RUN(f5_one_links_quarantine_does_not_disturb_anothers_relay_lease);
     RUN(f6_a_fault_on_the_link_holding_the_contactor_spares_the_other);
+    RUN(f7_more_charging_guns_do_not_cost_the_first_gun_margin);
     RUN(a_duplicate_link_is_refused);
     RUN(the_fleet_deadline_is_the_nearest_one_and_is_never_too_long);
     RUN(a_dead_transport_is_quarantined_and_the_sibling_is_untouched);
