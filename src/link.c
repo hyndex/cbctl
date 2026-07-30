@@ -73,9 +73,16 @@ void push_quarantine_event(cbctl_link_t *link, uint32_t now_ms);
  * A controller ticking at 400 ms has no use for a 1000 ms timeout anyway: a board that has not
  * answered a 3-byte request in 250 ms over 115200 baud is not about to. Tightening it bounds
  * the blocking at
- *     2 x (250 + 60) = 620 ms
- * which makes the safe-hold floor ~930 ms and leaves a 3 s hold with real margin. The retry
- * still exists; it is simply sized to the deadline it shares a wire with. */
+ *     (RETRY_LIMIT + 1) x 250 = 3 x 250 = 750 ms
+ * which makes the safe-hold floor 1900 ms (CBCTL_RELAY_HOLD_MIN_MS) and leaves the recommended
+ * 10 s hold with real margin. The retry still exists; it is simply sized to the deadline it
+ * shares a wire with.
+ *
+ * NOTE the arithmetic: RETRY_LIMIT is a RETRY count, so a limit of 2 puts THREE transmissions
+ * on the wire and waits out three timeouts; and the configured retry backoff is never applied
+ * by the session (restage_for_retry stamps pending_since = now with no backoff term). An
+ * earlier version of this comment read "2 x (250 + 60) = 620", which was wrong on both counts
+ * — the two errors nearly cancelled, which is exactly why it survived so long. */
 
 /* ---- intent bookkeeping ---------------------------------------------------------------- */
 

@@ -54,9 +54,9 @@ So:
 
 | | STATUS | DIAG |
 |---|---|---|
-| priority | above heartbeat, ages upward | strictly last, never ages |
+| priority | below the feed and the heartbeat at its normal 1 s cadence, but **ages upward**: past `CBCTL_STATUS_STARVE_MS` (3 s) it is promoted above the feed for one message | strictly last, never ages |
 | under load | guaranteed to get through | expected to be starved to zero |
-| while energy is live | required | **suppressed entirely** |
+| while energy is live | required | **the drain is suppressed**; level/category control still flows |
 
 Suppression is the load-bearing property and it has a test: `no_drain_competes_with_a_live_charge`
 asserts zero drains while a contactor is held or a session is open, and removing the guard makes

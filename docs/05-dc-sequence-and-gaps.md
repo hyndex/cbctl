@@ -77,7 +77,7 @@ mistake is more reusable than the fix.
 | Gun close trigger | **level**, re-asserted while in the energy phase | one-shot on a `SESSION_STARTED` edge | a missed edge meant the contactor never closed at all |
 | Isolation | controller decision (proxy, no IMD) | derived from module telemetry freshness | circular: isolation needs modules, modules need the EV target, the target needs CableCheck |
 | `power_ready` | property of the plant | same telemetry gate | EV looped on ChargeParameterDiscovery forever |
-| Contactor in FEEDBACK | reported | never set (`memset` only) | `contactor_open` forever, energy refused |
+| Contactor in FEEDBACK | reported | never set (`memset` only) ⇒ `CONTACTOR_UNKNOWN` | UNKNOWN is *tolerated* by the energy gate (not every install reports position); only an explicit OPEN refuses. Now derived from the board's own `relay_closed_mask` |
 | Bad telemetry | withhold | clamped **up** to the 1000 V ceiling | reported a 1000 V bus to a real vehicle |
 | Feed cadence | periodic | dirty on any change; mV jitter ⇒ every tick | 618 FEEDBACK vs 7 AUTHORIZE in 23 s; auth lease starved and lapsed |
 | Refused close | back off | retried at once, forever | 2509 refusals; the retries starved the fix |
@@ -115,9 +115,13 @@ harness, which plays the power supply. The gun contactor closes and is confirmed
 cbmodules drives these ENR-S0 modules correctly standalone: commanded 200 V → **200.0 V**; a
 0→1000 V ramp in 50 V steps tracks within ~1 % to **1008.1 V**, no faults.
 
-**Not verified:** a real charge. No session has yet delivered current, so the `dc_ans` liveness rule
-in §3's last row is **untested against a vehicle**, and cbplc's stability *while charging* is
-unproven — charging has not happened.
+**Verified since:** a real charge, end to end, driven by cbctl against cbplc. A vehicle was taken
+from 24 % to 100 % across both guns of the bench charger (`tools/charge_soc.c`), with 931 lease
+renewals all confirmed, zero lapses and zero late feeds. The `dc_ans` liveness rule in §3's last
+row is the survivor of two wrong rules before it (`secc_active`, then target-changed) and is now
+exercised against a vehicle. cbplc's stability *while charging* is no longer unproven.
+
+**Still not verified:** two vehicles charging simultaneously — the bench has one car.
 
 **A note on the 200 V floor:** `module_type_min_voltage_v(MaxwellEnr)` is 200 V and is applied
 whenever commanded current exceeds the ramp deadband. A vehicle asking for a precharge target below

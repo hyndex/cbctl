@@ -4,14 +4,22 @@
  *      examples/pi_two_guns.c src/[a-z]*.c ports/posix_serial.c \
  *      third_party/cbplc/src/[a-z]*.c \
  *      -o pi_two_guns
- *   ./pi_two_guns /dev/ttyACM0 /dev/ttyACM1
+ *   ./pi_two_guns /dev/serial/by-id/usb-Espressif_..._D0:CF:13:71:FF:54-if00 \
+ *                 /dev/serial/by-id/usb-Espressif_..._D0:CF:13:73:0A:68-if00
+ *
+ * OPEN BY /dev/serial/by-id/, NEVER BY ttyACM NUMBER. Port order changes across reboots and
+ * reflashes — and, measured on this project's own bench, within a single session. Passing
+ * /dev/ttyACM0 here is how gun 1's commands end up on gun 2's board.
  *
  * This is the shape a real controller has. Note what is NOT here: no resend loop, no lease
  * renewal, no timeout handling, no thread, and no retry-on-refusal. Those are the things a
  * hand-rolled controller gets wrong, and they are all inside cbctl_tick().
  *
- * The measurements below are FAKE — a real controller reads them from its meter and its power
- * modules. Everything else is exactly what you would ship.
+ * The measurements below are FAKE — a real controller reads them from its power modules (NOT
+ * its meter: the meter reads through a CT downstream of the contactor and is blind during
+ * PreCharge, which cost real charging sessions). Everything else is what you would ship,
+ * including the two patterns a controller cannot omit: pinning each gun to a board MAC, and
+ * reopening a port after the link is quarantined.
  */
 #include "cbctl/cbctl.h"
 #include "posix_serial.h"
@@ -45,6 +53,8 @@ static const char *state_name(cbctl_link_state_t s)
     default:                     return "?";
     }
 }
+
+static void recover_link(int gun);   /* defined below; the quarantine handler calls it */
 
 static void handle_events(cbctl_link_t *link, int gun)
 {
@@ -99,6 +109,7 @@ static void handle_events(cbctl_link_t *link, int gun)
             /* Loud on purpose: a charger that silently demotes a connector is worse than one
              * that fails, because the operator hears about it from a customer. */
             printf("gun%d: LINK QUARANTINED — connector out of service\n", gun);
+            recover_link(gun);
             break;
 
         default:
@@ -107,10 +118,47 @@ static void handle_events(cbctl_link_t *link, int gun)
     }
 }
 
+/* Gun -> board MAC. A real controller loads this from its configuration; all-zero disables the
+ * check for a bench run with unknown boards. */
+static const uint8_t kGunMac[2][6] = {
+    { 0, 0, 0, 0, 0, 0 },
+    { 0, 0, 0, 0, 0, 0 },
+};
+static const char *port[2];
+static cbctl_serial_t ser[2];
+static cbctl_link_t   link[2];
+
+/* RECOVERY IS THE CALLER'S JOB, AND OMITTING IT IS A WHOLE-CHARGER OUTAGE.
+ *
+ * cbctl contains a dead transport perfectly — the link quarantines, re-probes on a capped
+ * backoff, and its siblings never notice. What it will never do is reopen the port: the fd
+ * belongs to whoever opened it. A controller without this function turns any USB flap into a
+ * permanent outage for that gun, whose only cure is a process restart that kills the OTHER
+ * gun's live session too.
+ *
+ * Reopening IN PLACE matters: the fleet slot keeps its pointer, so nothing is removed or
+ * re-added and this works even at CBCTL_FLEET_MAX where an open-new-then-retire shape would be
+ * refused. cbctl_open() memsets the link, so EVERYTHING must be re-declared afterwards — that
+ * is the difference from a board reset, where the library re-asserts for you. */
+static void recover_link(int gun)
+{
+    printf("gun%d: reopening %s in place\n", gun, port[gun]);
+    cbctl_serial_close(&ser[gun]);
+    if (!cbctl_serial_open(&ser[gun], port[gun], 115200u) ||
+        cbctl_open(&link[gun], &ser[gun].tx) != CBCTL_OK) {
+        printf("gun%d: reopen FAILED — will retry on the next quarantine\n", gun);
+        return;
+    }
+    if (kGunMac[gun][0] != 0u) {
+        (void)cbctl_expect_mac(&link[gun], kGunMac[gun]);
+    }
+    /* Re-declare here what your controller had declared: envelope, measurement, authorisation,
+     * relay intent, provisioning and any diag arming. The steady-state loop below re-states the
+     * envelope and measurement every pass, so this example needs nothing more. */
+}
+
 int main(int argc, char **argv)
 {
-    cbctl_serial_t ser[2];
-    cbctl_link_t link[2];
     cbctl_fleet_t fleet;
     int n = 0, i;
     uint32_t next_report = 0u;
@@ -132,6 +180,14 @@ int main(int argc, char **argv)
             fprintf(stderr, "cannot attach %s\n", argv[i]);
             return 1;
         }
+        /* PIN THE GUN TO THE BOARD, not to the cable. cbctl_expect_mac() refuses once the
+         * board has identified itself as something else, which is the only defence against a
+         * swapped cable or a replaced board silently becoming "gun 1". Real controllers read
+         * this table from config; it is inline here to keep the example one file. */
+        if (kGunMac[n][0] != 0u) {
+            (void)cbctl_expect_mac(&link[n], kGunMac[n]);
+        }
+        port[n] = argv[i];   /* remembered: recovery must reopen the SAME path */
         printf("gun%d: %s\n", n, argv[i]);
         n++;
     }

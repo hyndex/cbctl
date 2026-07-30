@@ -16,7 +16,7 @@ firmware build `62a77ad2`, one real vehicle (`88:C9:B3:79:3F:68`), macOS host.
 |---|---|---|---|
 | 1.1 | Normal charge | feed held at **30–39 ms** against a 1500 ms bound; lease renewed at hold/6, every renewal ACK-confirmed | **measured**, 200 s live |
 | 1.2 | Controller re-declares the feed every pass | harmless — the library compares before marking dirty | **measured**; used to make LIMITS permanently due and starve the lease |
-| 1.3 | One message unanswered by the board | stop-and-wait blocks everything for the retry sequence — bounded to **750 ms** by cbctl's own timing (3 transmissions x a 250 ms timeout; the retry backoff is configured but never applied), so the derived hold floor (1640 ms) cannot lapse | **host test** + derivation; schema defaults gave 3300 ms and made the lease unrenewable (`acks=1`) |
+| 1.3 | One message unanswered by the board | stop-and-wait blocks everything for the retry sequence — bounded to **750 ms** by cbctl's own timing (3 transmissions x a 250 ms timeout; the retry backoff is configured but never applied), so the derived hold floor (1900 ms) cannot lapse | **host test** + derivation; schema defaults gave 3300 ms and made the lease unrenewable (`acks=1`) |
 | 1.4 | Vehicle never opens a session | not a charger fault. The reference harness reports the same on this vehicle | **measured**, both stacks |
 | 1.5 | Controller process dies | the board's dead-man opens the relay | **partially verified** — see §6.1 |
 
@@ -54,7 +54,7 @@ a ceiling the rest of your process eats into, not a budget you may spend.
 | # | Cause | Intended? | Handling |
 |---|---|---|---|
 | 4.1 | Controller stops renewing (crash, hang, power loss) | **yes — this is the point** | the board opens the relay itself |
-| 4.2 | Renewal blocked behind an unanswered request | **no** | timing bounded to 750 ms; AUTHORIZE lease floored at 1450 ms, derived from the re-assert period actually used (auth_period() clamps to a 500 ms floor, so the old lease/3 derivation did not hold for short leases and certified an unsafe 1130 ms) |
+| 4.2 | Renewal blocked behind an unanswered request | **no** | timing bounded to 750 ms; AUTHORIZE lease **refused** below 1450 ms — refused rather than raised, because permission is the caller's policy and silently lengthening it would grant more than was asked (`cbctl_authorize()` returns `CBCTL_E_ARG`). Derived from the re-assert period actually used (auth_period() clamps to a 500 ms floor, so the old lease/3 derivation did not hold for short leases and certified an unsafe 1130 ms) |
 | 4.3 | Renewal queued but never applied | **no** | the renewal clock is stamped from the **ACK**, not from queueing |
 | 4.4 | Renewal refused by a gate | **no** | the stamp is reset so it retries at once, `relay_refusals` counts it |
 | 4.5 | Wire quantisation | **no** | hold rounded UP to the 100 ms the wire carries, so the board's lease is never shorter than we believe |
@@ -166,11 +166,25 @@ while the loopback mutation could not tell the difference — its error path rea
 differently than a real closed fd does. **Do not trust the simulator alone for transport-death
 behaviour.** Hardware was the authority there, and would be again.
 
+### 6.3b Situations that are not the library's fault, and look exactly like its fault
+
+| # | Situation | What you see | The truth |
+|---|---|---|---|
+| 6.5 | Board came up **stranded in ROM download** (DTR state at power-up) | enumerates normally, answers nothing; link sits IDENTIFYING then quarantines and re-probes forever | electrical, not software. Recovery is a reset pulse — an EN-pulse, or `esptool --before default_reset --after hard_reset chip_id`. Seen twice in one day on the bench after power-cycles. **Do not condemn a board for "IDENTIFYING forever" without pulsing it first.** |
+| 6.6 | Another process already holds the tty | `cbctl_serial_open` fails, or a stale opener leaves an enumerated but silent device | ports are opened `TIOCEXCL` (`ports/posix_serial.c`). A production controller service auto-starts on boot and owns the PLC ports — `lsof /dev/ttyACM*` before debugging anything |
+| 6.7 | `Undervoltage detected` at boot, **no** USB over-current | rail sag in `dmesg`/hwmon, ports stay up | boot inrush against the 5 V supply — a different failure, from a different supply, than the ganged USB over-current trip in §N>2 item 1. Do not treat one as evidence of the other |
+| 6.8 | AUTHORIZE stops being re-asserted, **silently** | `cbctl_tick()` returns OK, feed stays fresh, `feed_late` 0, link stays READY — and the lease lapses mid-charge | measured: at a caller pass ≥ ~2000 ms the `lease/3` re-assert stopped advancing for 60 s. Now guarded by an AUTHORIZE danger preempt at `lease/2` that outranks the feed, mirroring the relay's. The general lesson stands: **a slow caller degrades things that report themselves healthy** |
+| 6.9 | Mute board (ACKs nothing) vs dead fd | both end in QUARANTINED | very different speeds: a dead fd is caught in ~7 ms; a mute board takes `CBCTL_LOSS_LIMIT` × `CBCTL_WORST_BLOCK_MS` = 5 × 750 = **3.75 s** |
+
 ### 6.4 Not implemented
 
-`CBPLC_T_DIAG` (the board's RAM log ring — a controller cannot pull board diagnostics),
-`cbctl_evcc_id`, `cbctl_fleet_by_mac`, `cbctl_request_restart`, and the CAN transport (needs
+`cbctl_evcc_id`, `cbctl_fleet_by_mac`, `cbctl_fleet_remove`, and the CAN transport (needs
 `CBPLC_MIN_TRANSPORT_MTU` 32→8, a firmware-side wire decision).
+
+Shipped since this list was written, and no longer missing: the **diagnostic ring** — a
+controller *can* pull board diagnostics (`cbctl_diag_enable`/`_set_level`/`_set_categories`/
+`_state`, see [06-diagnostics](06-diagnostics.md)) — and **`cbctl_request_restart`**, gated on
+CP=A with no session and every relay proven open ([07-provisioning](07-provisioning.md)).
 
 ## 7. What to watch in production
 
@@ -195,7 +209,11 @@ is what I believe".
 
 ## Deploying more than two PLCs — the constraints are outside the library
 
-fleet_bench (tools/fleet_bench.c) measured N=1/2/4/8, every link charging, on the bench Pi 4B:
+fleet_bench (tools/fleet_bench.c) measured N=1/2/4/8, every link charging, on the bench Pi 4B.
+**Provenance:** the bench has two physical boards, so N=4 and N=8 drive the in-process loopback —
+which runs the real cbplc session, framing and CRC code on the Pi's real CPU. Host cost and
+scheduling are therefore genuine measurements; USB latency is the modelled term, and it is
+precisely the term that does not aggregate (one device per link). Results:
 tick p50 0/0/1/2 us, worst pass 52/185/204/362 us; link 0's margins bit-identical at every N
 (feed 399 ms, renewal gap hold/6, AUTHORIZE gap lease/3); a half-fleet wedge storm quarantined
 every wedged board and left every survivor READY. The library's cost is linear microseconds and

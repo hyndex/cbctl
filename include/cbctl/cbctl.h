@@ -667,7 +667,8 @@ cbctl_status_t cbctl_slac_replug(cbctl_link_t *link, cbctl_op_t *out_op);
 /* Close relays as a LEASE. `hold_ms` is the dead-man: the PLC opens them ITSELF if the lease
  * is not renewed, which is what makes a crashed controller safe rather than merely detectable.
  *
- * You do not renew it. cbctl_tick() does, at hold/3 — three chances before it could lapse.
+ * You do not renew it. cbctl_tick() does, at hold/CBCTL_RELAY_RENEW_DIVISOR (hold/6) — five
+ * chances to lose a renewal before it could lapse.
  * That ratio is not arbitrary: on this project's own bench a 5 s hold was renewed by hand
  * every 2.0 s, a 2.5x margin, and one slow pass around a vehicle phase change let the lease
  * lapse, dropped the contactor mid-charge and re-closed it on the next renewal. That is what

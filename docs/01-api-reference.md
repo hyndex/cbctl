@@ -50,8 +50,13 @@ in these docs against `include/cbctl/cbctl.h`.
   earlier. EVCCID is a separate identity and stays deliberately unimplemented rather than
   half-implemented, because conflating the two is how a car gets billed to the wrong account.
 - `cbctl_fleet_by_mac()` — address a fleet member by board MAC. Not needed yet; index the
-  array you own.
-- `cbctl_request_restart()` — ask the PLC to restart a session.
+  array you own, pinning each link with `cbctl_expect_mac()`.
+- `cbctl_fleet_remove()` — retire a link. Not needed: recovery reopens a link **in place**
+  (see [00-integration-guide §9](00-integration-guide.md)), which is also what makes recovery
+  work at `CBCTL_FLEET_MAX`.
+
+**Shipped since this section was written** — no longer missing: `cbctl_request_restart()`
+(§13), the whole diagnostic subsystem (§11) and the whole provisioning subsystem (§12).
 
 A note on how this section came about, since it is the kind of drift that makes a document
 worse than useless: eight names in these docs had no counterpart in the header, and one of
@@ -100,19 +105,24 @@ Three things about this that surprise people, all of them load-bearing:
 
 ```c
 cbctl_link_t link;
-cbctl_status_t rc = cbctl_open(&link, &transport, &cfg);   /* 1. link up      */
-cbctl_identify(&link);                                      /* 2. WHICH board  */
-rc = cbctl_stop_clear(&link);                               /* 3. clear latch  */
-rc = cbctl_authorize(&link, CBCTL_AUTH_PENDING, 0);         /* 4. a decision   */
+cbctl_status_t rc = cbctl_open(&link, &ser.tx);            /* 1. link up      */
+/* 2. WHICH board — identification is AUTOMATIC. Tick until READY, then pin it: */
+while (cbctl_link_state(&link) != CBCTL_LINK_READY) { cbctl_tick(&link, now_ms()); /* +poll */ }
+rc = cbctl_expect_mac(&link, kThisGunsMac);                /* refuse a swapped board */
+rc = cbctl_stop_clear(&link);                              /* 3. clear latch  */
+rc = cbctl_authorize(&link, CBCTL_AUTH_PENDING, 0);        /* 4. a decision   */
 /* then, every tick, forever: */
 rc = cbctl_tick(&link, now_ms);
 ```
 
-**Step 2 is not optional and not cosmetic.** `cbctl_identify()` returns the board's MAC and
-build fingerprint. A run that cannot name the board and firmware that produced it is not
-evidence — this project lost days to two boards, one with a corrupted id and one physically
-dead, each mistaken for a firmware fault. cbctl therefore refuses every other call until
-`identify` has succeeded (`CBCTL_E_NOT_IDENTIFIED`).
+**Step 2 is not optional and not cosmetic.** Identification is a link *state*, not a call —
+there is no `cbctl_identify()`, because it cannot take a timeout when nothing blocks. Tick until
+`cbctl_link_state()` reports `CBCTL_LINK_READY`, then read the board's MAC and build fingerprint
+with `cbctl_identity()` and **pin them with `cbctl_expect_mac()`**. A run that cannot name the
+board and firmware that produced it is not evidence — this project lost days to two boards, one
+with a corrupted id and one physically dead, each mistaken for a firmware fault, and separately
+lost a bench day to `ttyACM` order swapping under it. cbctl refuses every other call until the
+board has identified (`CBCTL_E_NOT_IDENTIFIED`).
 
 **Step 3 exists because STOP is latched.** See §2.6. A PLC that was stopped by a previous
 controller — including a previous run of *your* controller — stays stopped. `cbctl_open()`
@@ -208,10 +218,10 @@ controller that refused.
 ### 2.5 Relays — a lease, never a command
 
 ```c
-cbctl_status_t cbctl_relay_close(cbctl_link_t *link,
-                                 cbctl_relay_mask_t which,
-                                 uint32_t hold_ms);     /* REQUIRED for GUN/AUX */
-cbctl_status_t cbctl_relay_open(cbctl_link_t *link, cbctl_relay_mask_t which);
+cbctl_status_t cbctl_relay_close(cbctl_link_t *link, uint8_t mask,
+                                 uint32_t hold_ms,      /* REQUIRED for GUN/AUX */
+                                 cbctl_op_t *out_op);   /* NULL if you will not track it */
+cbctl_status_t cbctl_relay_open(cbctl_link_t *link, uint8_t mask, cbctl_op_t *out_op);
 ```
 
 | relay | mask | notes |
@@ -240,7 +250,7 @@ one mistake with no safe outcome, and it is checked with no exception path.
 ### 2.6 STOP — latched, and that is deliberate
 
 ```c
-cbctl_status_t cbctl_stop(cbctl_link_t *link);        /* latch  */
+cbctl_status_t cbctl_begin_stop(cbctl_link_t *link);  /* latch + clear power_ready, atomically */
 cbctl_status_t cbctl_stop_clear(cbctl_link_t *link);  /* clear  */
 ```
 
@@ -256,8 +266,8 @@ then returns `CBCTL_E_STOP_STUCK` rather than letting you proceed believing othe
 
 The vehicle needs to be told, through the protocol, not by dropping the link:
 
-1. `cbctl_stop(link)` **and** clear `power_ready` in the same breath — use
-   `cbctl_begin_stop()`, which does both atomically and is the only correct way.
+1. `cbctl_begin_stop(link)` — it raises the latch **and** clears `power_ready` in the same
+   breath, atomically, which is the only correct way. There is no bare `cbctl_stop()`.
 2. Keep ticking. The feed must stay alive: `PowerDelivery(Stop)`, `WeldingDetection` and
    `SessionStop` are still controller-fed phases.
 3. Report the **real** measured voltage and current, and the contactor as open, once it is.
@@ -363,7 +373,8 @@ cbctl_fleet_add(&fleet, &link_a);
 cbctl_fleet_add(&fleet, &link_b);
 
 cbctl_fleet_tick(&fleet, now_ms);                    /* ticks every link      */
-cbctl_link_t *l = cbctl_fleet_by_mac(&fleet, mac);   /* address by identity   */
+/* Address links through the array you own — there is no cbctl_fleet_by_mac(); pin each
+ * link to its board with cbctl_expect_mac() at bring-up and index by gun number. */
 ```
 
 Guarantees the fleet layer provides:
@@ -382,14 +393,14 @@ Guarantees the fleet layer provides:
 | code | meaning | what you should do |
 |---|---|---|
 | `CBCTL_E_OK` | — | — |
-| `CBCTL_E_NOT_IDENTIFIED` | called before `identify` | call `cbctl_identify` |
+| `CBCTL_E_NOT_IDENTIFIED` | called before the board named itself | keep ticking until `cbctl_link_state()` is `CBCTL_LINK_READY` |
 | `CBCTL_E_WRONG_STATE` | illegal in the current state | see §2; the library names the state |
 | `CBCTL_E_NO_DEADMAN` | zero hold on GUN/AUX | supply a hold |
 | `CBCTL_E_LEASE_TOO_SHORT` | lease < 3 × tick period | lengthen the lease or tick faster |
 | `CBCTL_E_CONTRADICTORY` | `power_ready` while stopping | clear one of them |
 | `CBCTL_E_RANGE` | a value outside its legal range | fix the value; the library says which |
 | `CBCTL_E_REFUSED_NO_VEHICLE` | gun close with no vehicle | wait for `VEHICLE_PLUGGED` |
-| `CBCTL_E_REFUSED_UNSAFE` | a safety interlock held | read `cbctl_refusal_detail()` |
+| `CBCTL_E_REFUSED_UNSAFE` | a safety interlock held | read `cbctl_op_gate()` for the board's gate code |
 | `CBCTL_E_STOP_STUCK` | stop did not clear after retries | investigate the board; do not proceed |
 | `CBCTL_E_FEED_LATE` | you are behind your own cadence | tick more often |
 | `CBCTL_E_TIMEOUT` | no reply within the deadline | retry; if persistent, the link is down |
@@ -397,7 +408,7 @@ Guarantees the fleet layer provides:
 | `CBCTL_E_DUPLICATE` | that MAC is already in the fleet | you have two links to one board |
 | `CBCTL_E_NOT_YET` | the value does not exist yet | wait for the relevant event |
 
-`cbctl_refusal_detail()` returns the PLC's own breakdown of a refusal — which of
+`cbctl_op_gate()` returns the PLC's own gate code for a refusal — which of
 drift / safety / vehicle-present / controller-alive / authorised / no-stop-in-force held. A
 bare "not ready" sends you guessing across six gates; this is why the firmware reports all
 six and why the library surfaces them individually.
@@ -453,8 +464,10 @@ the charge. On POSIX set a write timeout; return `-1` rather than hanging. This 
 hypothetical — an unbounded write blocked a controller feed for ten seconds and killed a live
 charging session.
 
-Provided implementations: `cbctl_posix_serial` (Linux/macOS, USB-CDC or UART) and
-`cbctl_transport_loopback` for tests. UART and CAN are the same interface; CAN additionally
+Provided implementations: `ports/posix_serial.c` — `cbctl_serial_open()` / `cbctl_serial_close()`
+/ `cbctl_serial_fd()` (Linux/macOS, USB-CDC or UART) — and `ports/loopback.c`
+(`cbctl_loopback_init()` / `cbctl_loopback_poll()`) for tests, which runs the real cbplc session
+code on the far side of a byte queue. UART and CAN are the same interface; CAN additionally
 needs the segmentation configured for an 8-byte MTU, which the protocol already supports
 (`CBPLC_MIN_TRANSPORT_MTU` is 32 today — CAN support requires lowering that floor, see
 `docs/03-roadmap.md`).
@@ -466,8 +479,9 @@ needs the segmentation configured for an 8-byte MTU, which the protocol already 
 ### 9.1 A complete successful charge
 
 ```c
-cbctl_open(&link, &tp, &cfg);
-cbctl_identify(&link, &id, 3000);
+cbctl_open(&link, &ser.tx);
+while (cbctl_link_state(&link) != CBCTL_LINK_READY) { cbctl_tick(&link, now_ms()); /* +poll */ }
+cbctl_expect_mac(&link, kThisGunsMac);
 cbctl_stop_clear(&link);
 cbctl_authorize(&link, CBCTL_AUTH_PENDING, 0);
 
@@ -534,6 +548,105 @@ Do not treat this as a charger fault, and do not build a retry loop that assumes
 its contract is explicitly *"ask the vehicle to re-sound"*, not *"make it"*.
 
 ---
+
+## 10. Observability — everything you can ask the link
+
+Every one of these is **last-known-good**, stamped by the ~1 s STATUS poll, and none of them
+blocks. Two carry sentinels you must exclude from arithmetic before comparing.
+
+```c
+cbctl_link_state_t cbctl_link_state(const cbctl_link_t *link);   /* IDENTIFYING/READY/QUARANTINED */
+bool     cbctl_identity(const cbctl_link_t *link, cbctl_identity_t *out); /* MAC, build, reset reason */
+cbctl_status_t cbctl_expect_mac(const cbctl_link_t *link, const uint8_t mac[6]);
+bool     cbctl_flag(const cbctl_link_t *link, cbctl_flag_t f);   /* plugged, matched, session, ... */
+uint32_t cbctl_counter(const cbctl_link_t *link, cbctl_counter_t c);
+
+uint32_t cbctl_feed_age_ms(const cbctl_link_t *link, uint32_t now_ms);        /* SENTINEL */
+uint32_t cbctl_observation_age_ms(const cbctl_link_t *link, uint32_t now_ms); /* SENTINEL */
+uint32_t cbctl_lease_headroom_ms(const cbctl_link_t *link, uint32_t now_ms);
+
+bool     cbctl_ev_target(const cbctl_link_t *link, uint32_t *mv, uint32_t *ma);
+int      cbctl_ev_soc_pct(const cbctl_link_t *link);
+bool     cbctl_vehicle_mac(const cbctl_link_t *link, uint8_t out[6]);
+cbctl_op_state_t cbctl_op_state(const cbctl_link_t *link, cbctl_op_t op);
+```
+
+**The sentinels are the whole point of those two functions.** `cbctl_feed_age_ms()` returns
+`CBCTL_FEED_NEVER_SENT` (`0xFFFFFFFF`) until an envelope has actually gone out, and
+`cbctl_observation_age_ms()` returns `CBCTL_NEVER_OBSERVED` until a STATUS has landed —
+because "never declared" reading as "perfectly fresh" is a lie this library shipped once.
+**Exclude them at every arithmetic site, not just when you remember**: folding one into a
+running maximum produced `feed went stale (4294967295)` verdicts on demonstrably healthy links,
+and asserting only `gap < limit` passes loudest when nothing was ever sent.
+
+`cbctl_ev_target()` and `cbctl_ev_soc_pct()` return **validity, not just a value** — a target
+belonging to a session that has ended reads invalid rather than stale-but-plausible, because
+driving modules from a dead session's setpoint is how a bus gets energised for nobody.
+
+### 10.1 The LED preset
+
+```c
+cbctl_led_t   cbctl_led_preset(const cbctl_link_t *link, uint32_t now_ms);
+const char   *cbctl_led_name(cbctl_led_t p);
+```
+
+cbctl does not drive pixels; it tells you what state the gun is in so your display layer can
+render it. `cbctl_led_name()` is a pure lookup and the only public call not parameterised by a
+link.
+
+## 11. SLAC
+
+```c
+cbctl_status_t cbctl_slac_arm(cbctl_link_t *link, cbctl_op_t *out_op);
+cbctl_status_t cbctl_slac_replug(cbctl_link_t *link, cbctl_op_t *out_op);
+```
+
+`cbctl_slac_replug()` drives a CP E→B transition, which makes the vehicle re-initiate SLAC
+without anybody touching the cable — the escape hatch for a session that stranded before
+matching.
+
+## 12. Diagnostics — the board's log ring
+
+```c
+cbctl_status_t cbctl_diag_enable(cbctl_link_t *link, bool on,
+                                 cbctl_diag_sink_fn sink, void *user);
+cbctl_status_t cbctl_diag_set_level(cbctl_link_t *link, cbctl_diag_level_t level);
+cbctl_status_t cbctl_diag_set_categories(cbctl_link_t *link, uint32_t mask);
+cbctl_status_t cbctl_diag_clear(cbctl_link_t *link);
+bool cbctl_diag_state(const cbctl_link_t *link, uint8_t *level, uint32_t *categories,
+                      uint32_t *dropped, uint32_t *pending);
+bool cbctl_diag_control_supported(const cbctl_link_t *link);
+```
+
+Arming **requires a sink** (`sink == NULL` is `CBCTL_E_ARG`): a drain is destructive, the ring
+hands its bytes over and forgets them, so there must be somewhere for them to go. The drain is
+the lowest priority message there is and is **declined outright while energy is live** — the
+board keeps the bytes in its 16 KB ring and hands them over afterwards, intact. The control
+setters are not suppressed, only the drain. `dropped` non-zero means the ring lapped and your
+log has holes, which is the difference between a trace and a conclusion.
+
+Full guide: [06-diagnostics](06-diagnostics.md).
+
+## 13. Provisioning — what this charger is
+
+```c
+cbctl_status_t cbctl_provision_evse_id(cbctl_link_t *link, const char *id);   /* 7..37 chars */
+cbctl_status_t cbctl_provision_protocols(cbctl_link_t *link, uint8_t mask);   /* interop triage */
+cbctl_status_t cbctl_provision_attn_trim_db(cbctl_link_t *link, int8_t db);   /* per-board, ±30 */
+cbctl_status_t cbctl_provision_feed_deadline_ms(cbctl_link_t *link, uint16_t ms); /* bench only */
+bool           cbctl_provision_supported(const cbctl_link_t *link);
+cbctl_status_t cbctl_request_restart(cbctl_link_t *link, cbctl_op_t *out_op);
+```
+
+The board stores nothing: **the controller is the config store**, keyed by board MAC. A board
+that reboots returns to compiled defaults and cbctl re-asserts automatically. A caller-driven
+`cbctl_open()` does **not** — that path memsets the link, so you re-declare everything yourself.
+
+`cbctl_request_restart()` is gated twice: cbctl refuses it while you hold a relay closed, and
+the board refuses unless the connector is genuinely idle (CP=A, no session, every relay proven
+open by readback).
+
+Full guide: [07-provisioning](07-provisioning.md).
 
 ## 10. What this library deliberately does not do
 

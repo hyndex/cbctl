@@ -97,9 +97,10 @@ help you.
 ### 3.2 Enums for everything with a fixed vocabulary
 
 No `int` parameters with a documented range. `cbctl_auth_t`, `cbctl_isolation_t`,
-`cbctl_contactor_t`, `cbctl_relay_mask_t`, `cbctl_event_kind_t` are all enums, and the decode
+`cbctl_contactor_t` and `cbctl_event_kind_t` are all enums, and the decode
 path **rejects an unrecognised enumerant rather than mapping it to a default**. A newer PLC's
-value must never read as one of ours.
+value must never read as one of ours. (The relay mask is the exception and is deliberately a
+plain `uint8_t` of `CBPLC_RELAY_*` bits — it is a set, not an enumeration.)
 
 `cbctl_isolation_t` specifically:
 
