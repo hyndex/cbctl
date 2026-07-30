@@ -31,7 +31,7 @@ TESTS   := $(patsubst tests/test_%.c,$(BUILD)/test_%,$(TESTSRC))
 
 OBJ     := $(patsubst %.c,$(BUILD)/obj/%.o,$(VENDOR) $(SRC))
 
-.PHONY: all check test clean vendor live live-dual budget deadman charge example selftest boardlog provision
+.PHONY: all check test clean vendor live live-dual fleet-bench budget deadman charge example selftest boardlog provision
 # Objects are NOT intermediates. Without this make deletes them after linking, which throws
 # away their .d files, and the next build silently skips a rebuild after a HEADER change —
 # a stale binary that passes is worse than a broken one that fails.
@@ -64,6 +64,11 @@ $(BUILD)/live_session: tools/live_session.c $(OBJ)
 
 live-dual: $(BUILD)/live_dual
 $(BUILD)/live_dual: tools/live_dual.c $(OBJ)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) $< $(OBJ) -o $@
+
+fleet-bench: $(BUILD)/fleet_bench
+$(BUILD)/fleet_bench: tools/fleet_bench.c $(OBJ)
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $< $(OBJ) -o $@
 
