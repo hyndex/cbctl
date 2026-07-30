@@ -185,7 +185,7 @@ untouched.
 |---|---|---|
 | F1 | A link that never answers cannot delay another link's feed | **per-link deadlines**, independent and each armed from that link's own last exchange — not non-blocking I/O alone (see above) |
 | F2 | A link whose transport `send` refuses cannot stall the loop | `send` is contractually non-blocking; a refusal defers that link's frame to the next tick, and only that link's |
-| F3 | Work per tick is bounded regardless of N and of inbound volume | each link drains at most `CBCTL_RX_PER_TICK` frames, then yields — a **bounded quantum**, the second of the three mechanisms |
+| F3 | Work per tick is bounded regardless of N and of inbound volume | each link drains at most `CBCTL_POLL_PER_TICK` polls, then yields — a **bounded quantum**, the second of the three mechanisms |
 | F4 | Links are serviced fairly; no link is starved by a chattier one | round-robin start index rotates each tick |
 | F5 | One link's fault, reset, or quarantine changes no other link's state | links share no mutable state — the fleet owns only the array and the rotation index |
 | F6 | A wedged link is detected and contained, not retried forever | consecutive-loss counter → `QUARANTINED` with capped re-probe backoff |
@@ -198,7 +198,7 @@ is not a property maintained by careful coding, which is the kind of property th
 ### 3.2 Bounded work, and why fairness needs an explicit rotation
 
 A naïve `for (i = 0; i < n; i++) service(link[i])` is unfair under load: link 0 is always
-serviced first, and if each link may consume up to `CBCTL_RX_PER_TICK` frames, link 3 is
+serviced first, and if each link may consume up to `CBCTL_POLL_PER_TICK` polls, link 3 is
 serviced last on every single tick and is the first to suffer when the loop runs late. Over
 thousands of ticks that bias is systematic, not random. So:
 
@@ -241,20 +241,25 @@ your descriptors and tell me when to call you next.**
 
 ```c
 /* How long may the caller sleep before cbctl needs servicing?
-   0 = service now. CBCTL_FOREVER = nothing pending. */
-uint32_t cbctl_next_deadline_ms(const cbctl_fleet_t *fleet, uint32_t now_ms);
-
-/* Descriptors to wait on, for hosts that have them. Returns the count written. */
-size_t cbctl_pollfds(const cbctl_fleet_t *fleet, struct pollfd *out, size_t cap);
+   0 = service now. */
+uint32_t cbctl_fleet_next_deadline_ms(const cbctl_fleet_t *fleet, uint32_t now_ms);
 ```
+
+The descriptors come from the caller, who opened the ports and therefore already has them —
+`cbctl_serial_fd(&ser)` per port. There is no `cbctl_pollfds()` aggregator; an earlier draft
+of this document sketched one and it was never built, because the caller assembling its own
+`pollfd` array from the fds it opened is one line per link and needs no library help.
 
 **Hosted (Pi, Linux SBC)** — sleep precisely, wake on data or deadline:
 
 ```c
-size_t n  = cbctl_pollfds(&fleet, fds, 8);
-int    ms = (int)cbctl_next_deadline_ms(&fleet, monotonic_ms());
-poll(fds, n, ms);
-cbctl_tick(&fleet, monotonic_ms());
+struct pollfd fds[CBCTL_FLEET_MAX];
+for (i = 0; i < n_links; i++) {
+    fds[i].fd = cbctl_serial_fd(&ser[i]);
+    fds[i].events = POLLIN;
+}
+poll(fds, n_links, (int)cbctl_fleet_next_deadline_ms(&fleet, monotonic_ms()));
+cbctl_fleet_tick(&fleet, monotonic_ms());
 ```
 
 **Bare metal / RTOS** — no descriptors exist, so ignore them and tick on your existing timer:
@@ -263,25 +268,24 @@ cbctl_tick(&fleet, monotonic_ms());
 if (tick_elapsed(400)) cbctl_tick(&fleet, monotonic_ms());
 ```
 
-`cbctl_pollfds()` returns 0 on ports with no descriptors, which is not an error — it is the
-honest answer, and it degrades to the polled form with no `#ifdef` in the caller. The
-descriptor comes from the port (`ports/posix_serial.c`), never from `src/`, which keeps the
-core free of OS calls.
+The descriptor comes from the port (`ports/posix_serial.c`), never from `src/`, which keeps
+the core free of OS calls.
 
 **The asymmetry is deliberate and is the reviewed conclusion of the prior art:** of the two
 halves of the classic "get fd + get timeout" idiom, only one ports. A descriptor presupposes
 an OS that has them; a *next deadline* is meaningful on every target including a bare-metal
 timer loop. So in cbctl:
 
-> `cbctl_next_deadline_ms()` is **mandatory** and every port must answer it.
-> `cbctl_pollfds()` is **optional** and may honestly return 0.
+> `cbctl_fleet_next_deadline_ms()` is **mandatory** and every port must answer it.
+> The fd array is the **caller's**, built from the ports it opened; a port with no
+> descriptor simply contributes none and the loop degrades to the polled form.
 
 A note on currency, since this idiom has moved: curl's own documentation now labels the
 `curl_multi_fdset` + `curl_multi_timeout` pair **"the older API"** and steers event-driven
 callers to `curl_multi_socket_action` with socket/timer callbacks; the poll-shaped
 `curl_multi_waitfds` only appeared in 8.8.0. cbctl uses the pull shape with `struct pollfd`
 knowingly. The push shape exists to avoid rebuilding an `fd_set` over thousands of sockets
-every iteration — a real problem at curl's scale and a non-problem at `CBCTL_FLEET_MAX` = 4.
+every iteration — a real problem at curl's scale and a non-problem at `CBCTL_FLEET_MAX` = 8.
 Choosing the simpler contract here is a scale judgement, not an oversight, and it is recorded
 as such so nobody "modernises" it without a reason.
 
@@ -318,7 +322,7 @@ able to cost a session.
 |---|---|---|
 | tick cadence | 400 ms | 3.75× margin on the 1500 ms bound |
 | feed repeat | every tick | LIMITS + FEEDBACK |
-| worst-case tick cost | bounded by `CBCTL_RX_PER_TICK` × N | no unbounded loop, no wait |
+| worst-case tick cost | bounded by `CBCTL_POLL_PER_TICK` × N | no unbounded loop, no wait |
 | auth lease | 8000 ms default | ≫ tick, so one missed tick cannot lapse it |
 | heartbeat timeout | 32000 ms default | the outer dead-man |
 | feed grace | 10000 ms | past this the session fails cleanly, not by TCP reset |
@@ -458,7 +462,7 @@ Items 1 and 3 are the two worth closing before a fleet deployment.
 | 3 | `feed.c`, `lease.c` — repetition, staleness, leases | feed held < 1500 ms across a 1 h loopback soak |
 | 4 | `status.c`, `event.c` — typed snapshot, synthesised events | live flags vs cumulative counters cannot be confused |
 | 5 | `fleet.c` — N links, rotation, quarantine | **F1–F6 each with a wedged-link test** |
-| 6 | `posix_serial.c`, `cbctl_pollfds` | worked Pi example, 2 PLCs, one killed mid-charge |
+| 6 | `posix_serial.c`, caller-built pollfd array | worked Pi example, 2 PLCs, one killed mid-charge |
 | 7 | CAN transport | needs `CBPLC_MIN_TRANSPORT_MTU` 32 → 8, a firmware-side decision |
 
 Phase 5's gate is the one that matters for this document, and it is stated as a falsifiable

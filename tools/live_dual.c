@@ -62,6 +62,21 @@ int main(int argc, char **argv)
      * a dual-gun charger has to answer is whether ONE going away takes the other with it. */
     uint32_t kill_at_s = (argc > 4) ? (uint32_t)atoi(argv[4]) : 0u;
     bool killed = false;
+    /* Recovery, 12 s after the kill. This is the half nothing in the tree demonstrated: the
+     * library contains a dead transport perfectly — quarantine, backoff, sibling untouched —
+     * and then NOTHING ever reopens the port, because no shipped caller closes an fd anywhere
+     * except at process exit. In the field that means a single gun's USB flap is a permanent
+     * outage for that gun until someone restarts the whole process, which kills the OTHER
+     * gun's session too. A hub reset — the documented Pi 4B failure, over-current switching
+     * every ganged port at once — makes it a whole-charger outage.
+     *
+     * The mechanism was always sound, just unexercised: cbctl_serial_open() rebuilds fd, RX
+     * accumulator and the tx vtable inside the SAME cbctl_serial_t the link's transport pointer
+     * already refers to, and cbctl_open() memsets the link back to IDENTIFYING. The fleet slot
+     * keeps its pointer — nothing is removed or re-added, which also means this works at
+     * N == CBCTL_FLEET_MAX, where an open-new-then-retire shape would be refused. */
+    bool recovered = false;
+    uint32_t recover_at_s = 0u;
     uint32_t worst_feed_after_kill = 0u;
     uint32_t worst_feed[NLINK] = { 0u, 0u };
     uint32_t base_lease[NLINK] = { 0u, 0u }, base_load[NLINK] = { 0u, 0u };
@@ -182,7 +197,19 @@ int main(int argc, char **argv)
             killed = true;
             printf("[%6ums] *** KILLING gun1's transport (models a USB drop) ***\n", t - t0);
             cbctl_serial_close(&ser[1]);
+            recover_at_s = kill_at_s + 12u; /* long enough to observe a settled quarantine */
         }
+        /* THE RECOVERY. Reopen the same by-id path in place and let the link re-identify. */
+        if (killed && !recovered && recover_at_s != 0u && (t - t0) / 1000u >= recover_at_s) {
+            recovered = true;
+            printf("[%6ums] *** REOPENING gun1's transport in place ***\n", t - t0);
+            if (!cbctl_serial_open(&ser[1], argv[2], 115200u) ||
+                cbctl_open(&link[1], &ser[1].tx) != CBCTL_OK) {
+                printf("  GATE: in-place reopen failed\n");
+                errors++;
+            }
+        }
+
         /* After the kill, gun0's feed age is the whole question. */
         if (killed && cbctl_link_state(&link[0]) == CBCTL_LINK_READY) {
             const uint32_t a = cbctl_feed_age_ms(&link[0], t);
@@ -256,9 +283,19 @@ int main(int argc, char **argv)
             printf("  GATE: gun0 did not stay READY while gun1 died\n");
             errors++;
         }
-        if (cbctl_link_state(&link[1]) == CBCTL_LINK_READY) {
+        if (!recovered && cbctl_link_state(&link[1]) == CBCTL_LINK_READY) {
             printf("  GATE: gun1 still reports READY after its transport died\n");
             errors++;
+        }
+        if (recovered) {
+            /* The whole point of the exercise: the gun that died came BACK, in the same
+             * process, in the same fleet slot, without touching gun0. */
+            if (cbctl_link_state(&link[1]) != CBCTL_LINK_READY) {
+                printf("  GATE: gun1 did not return to READY after the in-place reopen\n");
+                errors++;
+            } else {
+                printf("  gun1 RECOVERED: quarantined -> reopened -> READY, same fleet slot\n");
+            }
         }
     }
     printf("  duplicate boards detected : %u  (must be 0)\n", fleet.duplicate_boards);
@@ -285,8 +322,12 @@ int main(int argc, char **argv)
                    link[i].worst_tick_gap_ms, link[i].relay_danger_preempts);
         }
 
-        if (killed && i == 1) {
+        if (killed && i == 1 && !recovered) {
             continue; /* deliberately destroyed; it is the SURVIVOR that is on trial */
+        }
+        if (killed && i == 1 && recovered) {
+            continue; /* died and returned mid-run: its feed-age history spans the outage, which
+                       * is real but is not a gate — READY-after-reopen above is its gate */
         }
         if (worst_feed[i] == 0u && link[i].limits_sent == 0u) {
             /* Nothing was ever declared on this link, so there is no feed to judge. Reporting

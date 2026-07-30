@@ -358,7 +358,7 @@ returned from `identify`, which cannot be misconfigured the way a stored id can.
 
 ```c
 cbctl_fleet_t fleet;
-cbctl_fleet_init(&fleet, links, CBCTL_FLEET_MAX);
+cbctl_fleet_init(&fleet);
 cbctl_fleet_add(&fleet, &link_a);
 cbctl_fleet_add(&fleet, &link_b);
 

@@ -192,3 +192,37 @@ Every one of these is a counter cbctl already keeps. None should move on a healt
 `cbctl_observation_age_ms()` returns `CBCTL_NEVER_OBSERVED` rather than 0 before the first
 snapshot — 0 would read as "perfectly current", the most dangerous possible answer to "how old
 is what I believe".
+
+## Deploying more than two PLCs — the constraints are outside the library
+
+fleet_bench (tools/fleet_bench.c) measured N=1/2/4/8, every link charging, on the bench Pi 4B:
+tick p50 0/0/1/2 us, worst pass 52/185/204/362 us; link 0's margins bit-identical at every N
+(feed 399 ms, renewal gap hold/6, AUTHORIZE gap lease/3); a half-fleet wedge storm quarantined
+every wedged board and left every survivor READY. The library's cost is linear microseconds and
+the margins are period-bound, not contention-bound. What actually decides an N>2 deployment:
+
+1. **Power the boards off the USB bus. Non-negotiable.** An ESP32-S3 board declares ~500 mA and
+   the Pi 4B's whole USB budget is ~1.2 A with GANGED over-current switching: one trip drops
+   every port at once. Two boards already trip it in the field (`throttled=0x50000`); eight is
+   ~4 A. Use a self-powered hub with per-port over-current, or the enclosure's 5 V rail with
+   data-only USB. A bus-powered hub changes nothing.
+
+2. **Open by `/dev/serial/by-id/`, pin with `cbctl_expect_mac()`.** `ttyACM` ordering renumbers
+   across reflashes and flaps — measured on the bench: the same board changed device node within
+   one session. The by-id path is stable per board; the MAC pin catches the case where even that
+   lies (a replaced board on the same cable).
+
+3. **Own the reopen. The library quarantines; only the caller can reconnect.** cbctl contains a
+   dead transport correctly — quarantine, capped backoff, siblings untouched — but nothing in
+   the library ever closes or reopens an fd, deliberately (the port belongs to the caller). A
+   caller that never reopens has turned every USB flap into a permanent single-gun outage whose
+   only cure, a process restart, kills the other guns' sessions too. The pattern is in
+   tools/live_dual.c: on quarantine, `cbctl_serial_close()`, `cbctl_serial_open()` the same
+   by-id path, `cbctl_open()` the same link in place. The fleet slot keeps its pointer, so this
+   works at N == CBCTL_FLEET_MAX where an open-new-then-retire shape would be refused; re-assert
+   provisioning and intents after, since `cbctl_open()` starts the link from zero.
+
+4. **Budget the caller, not the library.** The binding arithmetic at any N is the caller's pass
+   gap G: worst feed age = 400 (period) + 750 (one full retry ladder) + G, against the board's
+   1500 ms bound — so G must stay under ~350 ms. cbctl's own share of that at N=8 is the worst
+   pass above: 362 us.

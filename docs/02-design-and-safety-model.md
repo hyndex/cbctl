@@ -193,7 +193,7 @@ Compile-time, in `cbctl_config.h`, all with defaults that work:
 
 | knob | default | why |
 |---|---|---|
-| `CBCTL_FLEET_MAX` | 4 | a controller managing more than four PLCs is unusual; raise freely |
+| `CBCTL_FLEET_MAX` | 8 | measured to N=8 (fleet_bench: worst pass 362 us on a Pi 4B); the worst-pass arithmetic supports ~12, so treat raises past that with a fresh measurement, not the old "raise freely" |
 | `CBCTL_MTU` | 1040 | matches cbplc's transport; lower to 32 for CAN |
 | `CBCTL_RX_BUF` | 4352 | one max message plus framing |
 | `CBCTL_STATUS_KEYS` | 192 | the parser's key table; cbplc emits ~165 today |
