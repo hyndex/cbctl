@@ -607,6 +607,26 @@ cbctl_status_t cbctl_tick(cbctl_link_t *link, uint32_t now_ms);
 
 cbctl_link_state_t cbctl_link_state(const cbctl_link_t *link);
 
+/* Is this link's quarantine the PERMANENT kind?
+ *
+ * The two quarantines mean opposite things to a caller and the state enum cannot tell them
+ * apart:
+ *
+ *   RECOVERABLE — consecutive losses on the wire. The board stopped answering: unplugged,
+ *   rebooting, a dead fd. It carries a deadline and a backoff, and the right response is to
+ *   REBUILD THE TRANSPORT and try again. cbctl cannot do that itself — it does not own the
+ *   fd — so the port layer has to, and it needs to know this is the case it should act on.
+ *
+ *   PERMANENT — the board on this port is not the board that was here before. Deliberately
+ *   NOT a deadline: reopening cannot fix a swapped board, and a controller that renumbers
+ *   its guns underneath itself is how the wrong contactor gets closed. Contain it and wait
+ *   for a human.
+ *
+ * Without this distinction a port layer either never reopens (and one USB re-enumeration
+ * disables a gun for the life of the process) or reopens on everything (and a swapped board
+ * is re-adopted in a loop). False for a NULL or non-quarantined link. */
+bool cbctl_quarantine_is_permanent(const cbctl_link_t *link);
+
 /* Which board is this? False until it has identified.
  *
  * READ THIS AND PIN IT. On a multi-gun charger the port a board appears on is NOT stable —

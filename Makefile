@@ -94,6 +94,19 @@ $(BUILD)/module_selftest: tools/module_selftest.c $(POWSRC)
 	$(CC) $(CFLAGS) -c $< -o $(BUILD)/module_selftest.o
 	$(CXX) $(BUILD)/module_selftest.o $(BUILD)/pow/*.o -o $@
 
+# weld_timing measures how fast the gun-side meter can prove a contactor opened,
+# which is the number SafetyLimits::discharge_dwell_ms has to exceed. Same driver
+# set as charge_soc for the same reason: a bench that drives hardware its own way
+# is testing the bench.
+weld-timing: $(BUILD)/weld_timing
+$(BUILD)/weld_timing: tools/weld_timing.c $(POWSRC) $(OBJ)
+	@mkdir -p $(BUILD)
+	@test -d $(CBMOD) || { echo "need sibling checkouts $(CBMOD) and $(CBMET)"; exit 1; }
+	$(CXX) -std=c++17 $(OPT) $(POWINC) -c $(POWSRC) 2>&1 | grep -v '^$$' || true
+	@mkdir -p $(BUILD)/pow && mv -f *.o $(BUILD)/pow/ 2>/dev/null || true
+	$(CC) $(CFLAGS) -c $< -o $(BUILD)/weld_timing.o
+	$(CXX) $(BUILD)/weld_timing.o $(OBJ) $(BUILD)/pow/*.o -o $@
+
 charge: $(BUILD)/charge_soc
 $(BUILD)/charge_soc: tools/charge_soc.c $(POWSRC) $(OBJ)
 	@mkdir -p $(BUILD)

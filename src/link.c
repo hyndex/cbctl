@@ -484,6 +484,14 @@ cbctl_link_state_t cbctl_link_state(const cbctl_link_t *link)
     return (link != NULL) ? link->state : CBCTL_LINK_CLOSED;
 }
 
+bool cbctl_quarantine_is_permanent(const cbctl_link_t *link)
+{
+    if (link == NULL || link->state != CBCTL_LINK_QUARANTINED) {
+        return false;
+    }
+    return link->quarantine_permanent;
+}
+
 cbctl_status_t cbctl_set_envelope(cbctl_link_t *link, const cbctl_envelope_t *env)
 {
     if (link == NULL || env == NULL) {
