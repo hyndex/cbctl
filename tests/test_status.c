@@ -571,6 +571,225 @@ TEST(the_ev_target_does_not_outlive_its_session)
     printf("    stale EV target dropped at session end\n");
 }
 
+/* THE SIX PILOT STATES, AND WHICH THREE OF THEM ARE A CAR.
+ *
+ * IEC 61851: A is nothing plugged, B/C/D are a vehicle, E and F are FAULTS. The rule here used
+ * to be `cp != 'A'`, so E and F were vehicles — and on 2026-08-01 an e-stop that drove the pilot
+ * to F opened 192 OCPP sessions on connector 2 for a car that was not there, then latched the
+ * connector in Finishing forever. Walk all six. */
+TEST(only_b_c_and_d_are_a_vehicle)
+{
+    cbctl_link_t link;
+    cbctl_loopback_t lb;
+    uint32_t now = 1000u;
+    static const struct {
+        char cp;
+        bool present;
+        bool fault;
+    } kCases[] = {
+        { 'A', false, false },
+        { 'B', true,  false },
+        { 'C', true,  false },
+        { 'D', true,  false },
+        { 'E', false, true  },   /* was: "a vehicle is plugged in" */
+        { 'F', false, true  },   /* was: "a vehicle is plugged in" — the e-stop case */
+    };
+    size_t c;
+
+    bring_up(&link, &lb, &now);
+    for (c = 0u; c < sizeof kCases / sizeof kCases[0]; c++) {
+        lb.cp = kCases[c].cp;
+        for (int i = 0; i < 8; i++) {
+            step(&link, &lb, &now, 600u);
+        }
+        printf("    cp=%c present=%d fault=%d\n", kCases[c].cp,
+               cbctl_flag(&link, CBCTL_FLAG_VEHICLE_PRESENT) ? 1 : 0,
+               cbctl_flag(&link, CBCTL_FLAG_PILOT_FAULT) ? 1 : 0);
+        CHECK(cbctl_flag(&link, CBCTL_FLAG_VEHICLE_PRESENT) == kCases[c].present);
+        CHECK(cbctl_flag(&link, CBCTL_FLAG_PILOT_FAULT) == kCases[c].fault);
+    }
+}
+
+/* THE BOARD'S OWN VERDICT OUTRANKS OUR READING OF THE LETTER.
+ *
+ * cbplc publishes `vehicle=` (and the identical `connected=`) from cbplc_cp_connected() — B/C/D
+ * ANDed with whether its decoder trusts the input at all — and gates the gun contactor on that
+ * same value. Re-deriving it here from the letter is how the two drift apart, and the half of a
+ * disagreement that closes a contactor is not the half this library controls. cbctl parsed
+ * neither field; the board was saying vehicle=0 while cbctl said a car was plugged in.
+ *
+ * The letter remains the fallback for a board too old to publish it — which is what every other
+ * test in this file, and the loopback, exercise. */
+TEST(the_boards_explicit_vehicle_field_is_believed_over_the_pilot_letter)
+{
+    cbctl_link_t link;
+    cbctl_loopback_t lb;
+    uint32_t now = 1000u;
+    /* A trusted B with the board denying presence. Contrived on today's firmware — a lost
+     * sampler forces the letter to UNKNOWN too — but it is the precedence rule itself under
+     * test, and the rule is what stops the next divergence being a phantom session. */
+    static const char kDenied[] =
+        "cp=B cp_trusted=1 connected=0 vehicle=0 slac_matched=0 secc_active=0 stop=0 "
+        "safety=0 relay_closed=0x00 " CBCTL_STATUS_TAIL_KEY "=0";
+    static const char kConfirmed[] =
+        "cp=B cp_trusted=1 connected=1 vehicle=1 slac_matched=0 secc_active=0 stop=0 "
+        "safety=0 relay_closed=0x00 " CBCTL_STATUS_TAIL_KEY "=0";
+
+    bring_up(&link, &lb, &now);
+
+    cbctl_status_apply(&link, (const uint8_t *)kDenied, sizeof kDenied - 1u, now);
+    CHECK(!cbctl_flag(&link, CBCTL_FLAG_VEHICLE_PRESENT));
+    CHECK(!cbctl_flag(&link, CBCTL_FLAG_PILOT_FAULT));
+
+    cbctl_status_apply(&link, (const uint8_t *)kConfirmed, sizeof kConfirmed - 1u, now);
+    CHECK(cbctl_flag(&link, CBCTL_FLAG_VEHICLE_PRESENT));
+}
+
+/* AN UNREADABLE PILOT IS NOT A CAR — AND IT IS NOT AN EMPTY BAY EITHER.
+ *
+ * `cp=` is a NAME, not a character. When the CP sampler produces no reading, or one out of
+ * range, the board publishes the word "UNKNOWN" — and 'U' is not 'A', so the old rule counted a
+ * blind pilot as a plugged-in vehicle. It is not a FAULT either: the board publishes UNKNOWN on
+ * a single out-of-range sample, and taking a connector out of service for that would be a fault
+ * on a glitch.
+ *
+ * Nor may it read as an UNPLUG, which is the trap reading `vehicle=` opens. That field is ANDed
+ * with the board's own trust in the reading, so a blind pilot publishes `vehicle=0` —
+ * byte-identical to a car that drove away. cbplc does not act on its own raw field here; it
+ * holds the last believed presence for up to 3 s. cbctl's caller has no debounce of its own and
+ * takes !vehicle_present straight to Finishing/EvDisconnected, so cbctl holds too — and then
+ * lets go, or a dead CP front end strands the connector exactly as connector 2 was stranded.
+ * All three parts are asserted: no vehicle from nothing, no phantom unplug inside the hold, a
+ * real one after it. */
+TEST(an_unreadable_pilot_holds_its_vehicle_then_lets_go)
+{
+    cbctl_link_t link;
+    cbctl_loopback_t lb;
+    uint32_t now = 1000u;
+    cbctl_event_t ev;
+    int unplugged = 0;
+    static const char kBlind[] =
+        "cp=UNKNOWN cp_trusted=0 connected=0 vehicle=0 slac_matched=0 secc_active=0 stop=0 "
+        "safety=0 relay_closed=0x00 " CBCTL_STATUS_TAIL_KEY "=0";
+
+    bring_up(&link, &lb, &now);
+
+    /* Blind with nothing plugged: still not a vehicle, still not a fault. */
+    cbctl_status_apply(&link, (const uint8_t *)kBlind, sizeof kBlind - 1u, now);
+    CHECK(!cbctl_flag(&link, CBCTL_FLAG_VEHICLE_PRESENT));
+    CHECK(!cbctl_flag(&link, CBCTL_FLAG_PILOT_FAULT));
+
+    /* Park a real vehicle on the pilot, then blind the board underneath it. */
+    lb.cp = 'C';
+    for (int i = 0; i < 8; i++) {
+        step(&link, &lb, &now, 600u);
+    }
+    CHECK(cbctl_flag(&link, CBCTL_FLAG_VEHICLE_PRESENT));
+    while (cbctl_next_event(&link, &ev)) { /* discard the plug edge */
+    }
+
+    /* Inside the hold, the car is still there as far as anything downstream is concerned. */
+    cbctl_status_apply(&link, (const uint8_t *)kBlind, sizeof kBlind - 1u, now);
+    cbctl_status_apply(&link, (const uint8_t *)kBlind, sizeof kBlind - 1u,
+                       now + CBCTL_PILOT_BLIND_HOLD_MS - 1u);
+    CHECK(cbctl_flag(&link, CBCTL_FLAG_VEHICLE_PRESENT));
+    while (cbctl_next_event(&link, &ev)) {
+        if (ev.kind == CBCTL_EV_VEHICLE_UNPLUGGED) {
+            unplugged++;
+        }
+    }
+    CHECK(unplugged == 0);
+
+    /* Past it, a pilot we still cannot read is a connector that must go back to Available. */
+    cbctl_status_apply(&link, (const uint8_t *)kBlind, sizeof kBlind - 1u,
+                       now + CBCTL_PILOT_BLIND_HOLD_MS);
+    CHECK(!cbctl_flag(&link, CBCTL_FLAG_VEHICLE_PRESENT));
+    CHECK(!cbctl_flag(&link, CBCTL_FLAG_PILOT_FAULT));
+    while (cbctl_next_event(&link, &ev)) {
+        if (ev.kind == CBCTL_EV_VEHICLE_UNPLUGGED) {
+            unplugged++;
+        }
+    }
+    printf("    blind pilot: held, then released after %u ms, unplug events=%d\n",
+           (unsigned)CBCTL_PILOT_BLIND_HOLD_MS, unplugged);
+    CHECK(unplugged == 1);
+}
+
+/* THE E-STOP, END TO END: the connector must be reported FAULTED and EMPTY, and the vehicle it
+ * was holding must be reported gone so the session can be closed out.
+ *
+ * Both halves matter and they are separate failures. Presence stuck true is what opened 192
+ * sessions for nothing. The missing UNPLUGGED edge is why the connector never returned to
+ * Available — the board was reporting session_reason=vehicle_left and nothing consumed it. */
+TEST(an_estopped_pilot_faults_the_connector_and_retires_the_vehicle)
+{
+    cbctl_link_t link;
+    cbctl_loopback_t lb;
+    uint32_t now = 1000u;
+    cbctl_event_t ev;
+    int unplugged = 0;
+    static const char kEstop[] =
+        "cp=F cp_trusted=1 connected=0 vehicle=0 session=Idle session_reason=vehicle_left "
+        "slac_matched=0 secc_active=0 stop=0 safety=0 relay_closed=0x00 "
+        CBCTL_STATUS_TAIL_KEY "=0";
+
+    bring_up(&link, &lb, &now);
+    lb.cp = 'B';
+    for (int i = 0; i < 8; i++) {
+        step(&link, &lb, &now, 600u);
+    }
+    CHECK(cbctl_flag(&link, CBCTL_FLAG_VEHICLE_PRESENT));
+    while (cbctl_next_event(&link, &ev)) { /* discard the plug edge */
+    }
+
+    /* The e-stop lands. */
+    cbctl_status_apply(&link, (const uint8_t *)kEstop, sizeof kEstop - 1u, now);
+
+    CHECK(!cbctl_flag(&link, CBCTL_FLAG_VEHICLE_PRESENT));
+    CHECK(cbctl_flag(&link, CBCTL_FLAG_PILOT_FAULT));
+    while (cbctl_next_event(&link, &ev)) {
+        if (ev.kind == CBCTL_EV_VEHICLE_UNPLUGGED) {
+            unplugged++;
+        }
+    }
+    printf("    cp=F: present=%d fault=%d unplugged_events=%d\n",
+           cbctl_flag(&link, CBCTL_FLAG_VEHICLE_PRESENT) ? 1 : 0,
+           cbctl_flag(&link, CBCTL_FLAG_PILOT_FAULT) ? 1 : 0, unplugged);
+    CHECK(unplugged == 1);
+}
+
+/* A RELAY MASK WE CANNOT PARSE IS NOT "EVERY CONTACTOR IS OPEN".
+ *
+ * The malformed-digit path zeroed the mask and applied it, publishing "the gun is out" from a
+ * value it had just failed to read. Of the two ways to be wrong about a contactor, claiming an
+ * energised one is open is the expensive one. Unparseable keeps the last known good. */
+TEST(a_malformed_relay_mask_does_not_report_the_contactor_open)
+{
+    cbctl_link_t link;
+    cbctl_loopback_t lb;
+    uint32_t now = 1000u;
+    static const char kGarbled[] =
+        "cp=C cp_trusted=1 connected=1 vehicle=1 slac_matched=1 secc_active=1 stop=0 "
+        "safety=0 relay_closed=0xZZ " CBCTL_STATUS_TAIL_KEY "=0";
+
+    bring_up(&link, &lb, &now);
+    lb.cp = 'C';
+    lb.secc_active = true;
+    lb.relay_closed_mask = CBPLC_RELAY_GUN;
+    for (int i = 0; i < 8; i++) {
+        step(&link, &lb, &now, 600u);
+    }
+    CHECK(cbctl_flag(&link, CBCTL_FLAG_ENERGISED));
+    CHECK(link.relay_closed_mask == CBPLC_RELAY_GUN);
+
+    cbctl_status_apply(&link, (const uint8_t *)kGarbled, sizeof kGarbled - 1u, now);
+
+    printf("    garbled mask: energised=%d mask=0x%02X\n",
+           cbctl_flag(&link, CBCTL_FLAG_ENERGISED) ? 1 : 0, link.relay_closed_mask);
+    CHECK(cbctl_flag(&link, CBCTL_FLAG_ENERGISED));
+    CHECK(link.relay_closed_mask == CBPLC_RELAY_GUN);
+}
+
 int main(void)
 {
     printf("status\n");
@@ -591,6 +810,11 @@ int main(void)
     RUN(a_truncated_line_applies_nothing_at_all);
     RUN(the_overflow_marker_is_counted_not_discarded);
     RUN(the_ev_target_does_not_outlive_its_session);
+    RUN(only_b_c_and_d_are_a_vehicle);
+    RUN(the_boards_explicit_vehicle_field_is_believed_over_the_pilot_letter);
+    RUN(an_unreadable_pilot_holds_its_vehicle_then_lets_go);
+    RUN(an_estopped_pilot_faults_the_connector_and_retires_the_vehicle);
+    RUN(a_malformed_relay_mask_does_not_report_the_contactor_open);
     if (g_fail) {
         printf("FAIL status (%d)\n", g_fail);
         return 1;

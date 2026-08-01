@@ -175,7 +175,6 @@ void cbctl_status_apply(cbctl_link_t *link, const uint8_t *payload, size_t len, 
 void cbctl_status_apply(cbctl_link_t *link, const uint8_t *payload, size_t len, uint32_t now_ms)
 {
     const char *buf = (const char *)payload;
-    const bool had = link->have_flags;
     bool now_flags[CBCTL_FLAG__COUNT];
     uint32_t v;
     size_t vlen = 0u;
@@ -185,6 +184,13 @@ void cbctl_status_apply(cbctl_link_t *link, const uint8_t *payload, size_t len, 
     if (link == NULL || payload == NULL || len == 0u) {
         return;
     }
+
+    /* READ AFTER THE GUARD, NOT BEFORE IT. This initialiser sat in the declaration block above,
+     * so it dereferenced `link` three lines before the NULL check that exists to stop exactly
+     * that — and at -O2 a compiler is entitled to conclude from the dereference that `link`
+     * cannot be NULL and delete the check outright, turning a defensive return into a crash. */
+    const bool had = link->have_flags;
+
     memset(now_flags, 0, sizeof now_flags);
 
     /* Hand the caller the raw line BEFORE any gate — see cbctl.h. A rejected line is exactly
@@ -233,10 +239,105 @@ void cbctl_status_apply(cbctl_link_t *link, const uint8_t *payload, size_t len, 
     }
 
     /* --- live flags --- */
+
+    /* The pilot letter, and ONLY when it is a letter. The board publishes `cp=` as a NAME, not
+     * a character: "A".."F", but also "UNKNOWN" when its CP sampler produced no reading or an
+     * out-of-range one, and "?" for a state that does not exist. Anything longer than one
+     * character is not a pilot state and must not be classified as one — reading p[0] of
+     * "UNKNOWN" gets you 'U', which is not 'A', which is how an unreadable pilot became a car. */
     p = field(buf, len, "cp", &vlen);
-    if (p != NULL && vlen >= 1u) {
-        now_flags[CBCTL_FLAG_VEHICLE_PRESENT] = (p[0] != 'A');
+    if (vlen != 1u) {
+        p = NULL;
     }
+
+    /* WHAT COUNTS AS A VEHICLE, AND WHY IT IS NOT "THE PILOT HAS LEFT A".
+     *
+     * This line read `(p[0] != 'A')`. IEC 61851 has six pilot states: A is nothing plugged,
+     * B/C/D are a vehicle, and E and F are FAULTS — the pilot pulled to the diode short, or the
+     * EVSE driving its own error state. Under the old rule every one of E, F and "UNKNOWN"
+     * counted as a plugged-in car.
+     *
+     * What that cost, live, 2026-08-01: an e-stop drove CP to F, cbctl reported a vehicle
+     * present, and the controller opened an OCPP session for a car that was not there. It did it
+     * 192 times on connector 2 — /opt/evse/runtime/state/ocpp_sessions read {"1":0,"2":192} —
+     * and the connector latched in Finishing and never returned to Available. The board had been
+     * publishing vehicle=0 connected=0 session_reason=vehicle_left the entire time. Nothing in
+     * this file read any of it.
+     *
+     * So read it. `vehicle=` is the board's OWN verdict — cbplc_cp_connected(), which is B/C/D
+     * ANDed with whether the decoder trusts its input at all — and it is the same value the
+     * board's safety layer gates the gun contactor on (safety.c refuses CBPLC_RELAY_GUN when
+     * !pre->vehicle_present, in every ownership mode). Re-deriving that answer from the letter
+     * when the board has already stated it is how the two drift apart, and the half of the
+     * disagreement that closes a contactor is not the half we control. `connected=` carries the
+     * identical value today; one of the two is read, not both, because two sources for one fact
+     * is exactly the drift being fixed here.
+     *
+     * The letter stays as the FALLBACK — restricted to B, C and D — for a board too old to
+     * publish `vehicle=`. Neither key present means no vehicle proven, which is the direction
+     * that does not energise.
+     *
+     * BUT "THE BOARD CANNOT SEE THE PILOT" IS NOT "THE BAY IS EMPTY", AND THAT DISTINCTION IS
+     * THE WHOLE ELSE-BRANCH BELOW.
+     *
+     * `vehicle=` is cbplc_cp_connected(), which ANDs in cbplc_cp_trusted() — so a blind pilot
+     * publishes `cp=UNKNOWN vehicle=0`, indistinguishable at this parser from a car that drove
+     * away. cbplc publishes UNKNOWN on ONE out-of-range sample or one gap in the stream, with
+     * no debounce, by design. Believing it here would have been a NEW field failure and a
+     * mirror image of the one above: cbplc's session machine does not act on its own raw
+     * field, it holds the last believed presence for up to 3000 ms while energy flows
+     * (kPresenceHoldEnergisedMs) because a single glitch was ending live charges. cbctl's
+     * caller acts on cbctl, immediately and once — cbcontroller-v2 takes !vehicle_present
+     * straight to Finishing/EvDisconnected with no debounce of its own — so cbctl has to
+     * mirror the board's DECISION, not its sample.
+     *
+     * Hence: hold the last proven answer while the pilot is unreadable, for
+     * CBCTL_PILOT_BLIND_HOLD_MS, then let it fall to absent. Held rather than latched, because
+     * a dead CP front end that never recovers must still let the connector go back to
+     * Available. `had` keeps the very first STATUS falling to absent rather than to whatever
+     * a zeroed struct implies. */
+    if (p != NULL) {
+        link->pilot_blind_since_ms = 0u;
+        if (u32_field(buf, len, "vehicle", &v)) {
+            now_flags[CBCTL_FLAG_VEHICLE_PRESENT] = (v != 0u);
+        } else {
+            now_flags[CBCTL_FLAG_VEHICLE_PRESENT] =
+                (p[0] == 'B' || p[0] == 'C' || p[0] == 'D');
+        }
+    } else {
+        if (link->pilot_blind_since_ms == 0u) {
+            /* 0 is the "readable" sentinel, so a blind window that starts exactly at tick 0
+             * has to borrow tick 1. One millisecond, once, at boot. */
+            link->pilot_blind_since_ms = (now_ms == 0u) ? 1u : now_ms;
+        }
+        now_flags[CBCTL_FLAG_VEHICLE_PRESENT] =
+            had && link->flags[CBCTL_FLAG_VEHICLE_PRESENT] &&
+            (uint32_t)(now_ms - link->pilot_blind_since_ms) < CBCTL_PILOT_BLIND_HOLD_MS;
+    }
+
+    /* A FAULTED PILOT IS NOT AN EMPTY BAY, AND THE CALLER HAS TO BE ABLE TO TELL THEM APART.
+     *
+     * With presence corrected above, E and F now read as "no vehicle" — right for the energy
+     * path and useless to the operator, because a connector nobody can charge on then looks
+     * exactly like a free one. That is the other half of the 192-session incident: the connector
+     * that never came back to Available was never reported faulted either. A controller needs to
+     * FAULT this connector, not idle it, and one flag is the whole difference.
+     *
+     * E and F only. UNKNOWN is deliberately not a fault: the board publishes it the instant a
+     * single sample falls out of range, so faulting on it would take a healthy connector out of
+     * service on a glitch. "We cannot see the pilot" is answered by the blind hold above and by
+     * the observation-age bound, not by taking the connector out of service.
+     *
+     * FOR WHOEVER CALLS cbctl_slac_replug(): it does NOT raise this, and that is pinned rather
+     * than hoped for. The pulse drives the pilot to E for kReplugDwellMs = 180 ms, and cbplc
+     * carries a static_assert that the dwell stays under CBPLC_CP_DISCONNECT_DEBOUNCE_MS =
+     * 1200 ms — "a replug that outlasts the disconnect debounce would read as an unplug" — so
+     * the driven E never reaches the published state and never reaches this parser. The 3 s
+     * boot teardown DOES outlast it: a board that boots with a car already on the gun publishes
+     * cp=E, and this flag reads true, until the teardown ends. Honest, and the only
+     * self-inflicted case. */
+    now_flags[CBCTL_FLAG_PILOT_FAULT] = (p != NULL && (p[0] == 'E' || p[0] == 'F'));
+
     if (u32_field(buf, len, "slac_matched", &v)) {
         now_flags[CBCTL_FLAG_SLAC_MATCHED] = (v != 0u);
     }
@@ -252,22 +353,33 @@ void cbctl_status_apply(cbctl_link_t *link, const uint8_t *payload, size_t len, 
     if (u32_field(buf, len, "safety", &v)) {
         now_flags[CBCTL_FLAG_SAFETY_ASSERTED] = (v != 0u);
     }
-    /* relay_closed is a hex mask; a closed GUN bit is the board saying the contactor is in. */
+    /* relay_closed is a hex mask; a closed GUN bit is the board saying the contactor is in.
+     *
+     * A VALUE WE CANNOT PARSE IS NOT "EVERY RELAY IS OPEN". The malformed-digit path used to set
+     * mask = 0 and then apply it, so one bad character turned "I could not read this" into a
+     * published claim that the gun contactor is out — the same class of mistake as the pilot
+     * letter above, and the more expensive direction of the two: a controller, an operator or a
+     * driver reading "not energised" off a connector that is in fact live. Unparseable now
+     * applies nothing and keeps the last known good, which is the discipline the truncation
+     * guard at the top of this function already follows for the whole line. */
     {
         size_t rl = 0u;
         const char *rp = field(buf, len, "relay_closed", &rl);
-        if (rp != NULL && rl >= 3u && rp[0] == '0' && (rp[1] == 'x' || rp[1] == 'X')) {
-            unsigned mask = 0u;
-            for (size_t k = 2u; k < rl; k++) {
-                const int nib = hex_nibble(rp[k]);
-                if (nib < 0) {
-                    mask = 0u;
-                    break;
-                }
-                mask = (mask << 4) | (unsigned)nib;
+        unsigned mask = 0u;
+        bool ok = (rp != NULL && rl >= 3u && rp[0] == '0' && (rp[1] == 'x' || rp[1] == 'X'));
+        for (size_t k = 2u; ok && k < rl; k++) {
+            const int nib = hex_nibble(rp[k]);
+            if (nib < 0) {
+                ok = false;
+                break;
             }
+            mask = (mask << 4) | (unsigned)nib;
+        }
+        if (ok) {
             now_flags[CBCTL_FLAG_ENERGISED] = ((mask & CBPLC_RELAY_GUN) != 0u);
             link->relay_closed_mask = (uint8_t)mask;
+        } else {
+            now_flags[CBCTL_FLAG_ENERGISED] = had && link->flags[CBCTL_FLAG_ENERGISED];
         }
     }
 

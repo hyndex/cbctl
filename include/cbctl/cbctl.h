@@ -132,6 +132,31 @@ extern "C" {
 #define CBCTL_EV_TARGET_STALE_MS 6000u
 #endif
 
+/* HOW LONG AN UNREADABLE PILOT KEEPS THE VEHICLE IT LAST PROVED.
+ *
+ * cbplc publishes `cp=UNKNOWN` — and with it `vehicle=0 connected=0` — the instant ONE CP
+ * sample falls out of range or the sample stream gaps. It does that deliberately: "an
+ * unmeasurable pilot is the absence of a state and reporting a stale one over it would be a
+ * lie" (cbplc/src/cp.c). But the board does not ACT on that raw answer. Its own session
+ * machine holds the last believed presence for up to 3000 ms while energy is flowing
+ * (kPresenceHoldEnergisedMs, cbplc/src/app/main.cpp) precisely because a single glitch was
+ * ending live charges. Only the diagnostic field is raw.
+ *
+ * cbctl must mirror the board's DECISION, not its raw sample, because the caller acts on
+ * cbctl. One STATUS poll landing inside a blind window would otherwise drop
+ * CBCTL_FLAG_VEHICLE_PRESENT, synthesise CBCTL_EV_VEHICLE_UNPLUGGED, and the controller
+ * consumes that edge immediately and unconditionally — Finishing with EvDisconnected on a car
+ * still drawing current.
+ *
+ * Matched to the board's LONGEST hold so cbctl never calls a vehicle gone while cbplc is still
+ * holding it. BOUNDED, and the bound is the point: a permanently blind pilot — a dead CP front
+ * end — must eventually read empty, or the connector never returns to Available. That is the
+ * half of the 2026-08-01 incident that stranded connector 2, and an unbounded hold would
+ * rebuild it. Three STATUS polls at the library's 1000 ms cadence. */
+#ifndef CBCTL_PILOT_BLIND_HOLD_MS
+#define CBCTL_PILOT_BLIND_HOLD_MS 3000u
+#endif
+
 /* The floor auth_period() clamps the AUTHORIZE re-assert period to. Named here because
  * CBCTL_AUTH_LEASE_MIN_SAFE_MS is derived from it, and a floor that drifts away from the
  * constant derived from it is how the old derivation silently stopped being true. */
@@ -301,7 +326,12 @@ typedef struct {
  * one field (`secc_sess`, a total, read repeatedly as "a session is open"). Two disjoint
  * enums and two different accessors make it inexpressible. */
 typedef enum {
-    CBCTL_FLAG_VEHICLE_PRESENT = 0, /* pilot has left state A */
+    /* A VEHICLE IS PLUGGED IN — pilot B, C or D, as the board itself reports it.
+     *
+     * Not "the pilot has left A", which is what this used to be and what put 192 phantom OCPP
+     * sessions on a connector whose pilot was sitting in F. E and F are FAULTS and answer false
+     * here; see CBCTL_FLAG_PILOT_FAULT, and src/status.c for the incident. */
+    CBCTL_FLAG_VEHICLE_PRESENT = 0,
     CBCTL_FLAG_SLAC_MATCHED,
     CBCTL_FLAG_SESSION_ACTIVE,      /* a V2G session is open RIGHT NOW */
     CBCTL_FLAG_STOP_LATCHED,
@@ -311,6 +341,24 @@ typedef enum {
     CBCTL_FLAG_EV_READY,          /* the EV says it is ready for energy      */
     CBCTL_FLAG_EV_PAUSED,         /* the EV has asked to pause               */
     CBCTL_FLAG_EV_SOC_KNOWN,      /* an EVRESSSOC has actually been reported */         /* the board reports the gun contactor closed   */
+    /* THE PILOT IS IN A FAULT STATE (CP E or F). NOT the same question as VEHICLE_PRESENT.
+     *
+     * VEHICLE_PRESENT answers "is there a car to charge"; this answers "is this connector usable
+     * at all". Both are false on an e-stopped connector, and a controller that reads only the
+     * first cannot tell an empty bay from a broken one — so it keeps advertising a connector
+     * nobody can charge on. Fault the connector on this; do not merely idle it.
+     *
+     * Deliberately excludes the board's UNKNOWN pilot (an unreadable sample, published
+     * immediately and cleared as fast) — see CBCTL_PILOT_BLIND_HOLD_MS for what happens
+     * instead.
+     *
+     * cbctl_slac_replug() does NOT raise this, and the reason is pinned on the firmware side:
+     * its pulse drives the pilot to E for 180 ms, and a static_assert in cbplc holds that dwell
+     * below the 1200 ms disconnect debounce, so the driven E never reaches the PUBLISHED state
+     * and cbctl never sees it. The board's 3 s boot teardown does outlast the debounce — so a
+     * board that boots with a car already on the gun publishes E, and this flag reads true, for
+     * a second or two. That is honest; it is also the only case where it is self-inflicted. */
+    CBCTL_FLAG_PILOT_FAULT,
     CBCTL_FLAG__COUNT
 } cbctl_flag_t;
 
@@ -570,6 +618,11 @@ typedef struct {
     /* Observed state, parsed from STATUS. */
     bool     flags[CBCTL_FLAG__COUNT];
     bool     have_flags;
+    /* WHEN THE PILOT WENT UNREADABLE, or 0 while it is readable. Not a duplicate of the
+     * observation age: STATUS keeps arriving perfectly on time while the board reports it
+     * cannot see the pilot, so nothing else in this struct notices. See
+     * CBCTL_PILOT_BLIND_HOLD_MS. */
+    uint32_t pilot_blind_since_ms;
     uint32_t counters[CBCTL_CTR__COUNT];
     uint8_t  ev_mac[6];
     /* TWO stamps, deliberately. `last_status_req` is when we ASKED and drives the request
