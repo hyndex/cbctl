@@ -194,6 +194,17 @@ cbplc_err_t cbplc_poll(cbplc_session_t *s, uint32_t now_ms)
     if (s == NULL || s->tx == NULL) {
         return CBPLC_E_BAD_ARGUMENT;
     }
+    /* A transport whose function pointers are gone is DEAD, not misused:
+     * answer E_TRANSPORT so the caller's loss counting sees it, the same as a
+     * vanished fd. The pointers CAN go NULL underneath a live session — the
+     * POSIX port used to zero its vtable on a failed reopen while this session
+     * still held the pointer, and the next poll jumped through NULL. The port
+     * is fixed to keep its vtable callable; this guard stands regardless, so
+     * no future transport backend can reintroduce the crash through the one
+     * function every backend is polled by. */
+    if (s->tx->send == NULL || s->tx->recv == NULL) {
+        return CBPLC_E_TRANSPORT;
+    }
     s->last_now_ms = now_ms;
 
     /* 1. Push at most one outbound frame. One per poll keeps a large message from

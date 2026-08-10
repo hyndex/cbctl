@@ -121,6 +121,21 @@ bool cbctl_serial_open(cbctl_serial_t *s, const char *path, unsigned baud)
     memset(s, 0, sizeof *s);
     s->fd = -1;
     cbplc_stream_reset(&s->rx);
+    /* THE VTABLE IS POPULATED BEFORE THE FIRST FAILURE EXIT, NOT AFTER THE LAST
+     * SUCCESS STEP. A cbplc session holds a POINTER to this struct across reopen
+     * attempts, and the reopen races real hardware: a USB hub that dropped and is
+     * still re-enumerating makes open(2) fail ~1 s before the device returns.
+     * When these assignments lived after the settle/flush at the bottom, that
+     * failed reopen left send/recv zeroed while the link stayed registered — and
+     * the quarantine re-probe two seconds later jumped through NULL. That exact
+     * sequence killed controllerd on three chargers (SIGSEGV ~2 s after every
+     * hub drop). ser_send/ser_recv already answer fd<0 with CBPLC_E_TRANSPORT,
+     * so a failed open now leaves a struct that is safely callable and reports
+     * the transport dead — which is the answer the loss-counting wants. */
+    s->tx.ctx = s;
+    s->tx.send = ser_send;
+    s->tx.recv = ser_recv;
+    s->tx.mtu = CBPLC_STREAM_MAX;
 
     /* O_NONBLOCK on the OPEN as well as the fd: without it, open() itself blocks waiting for
      * carrier on a port with modem-control lines. O_NOCTTY so a serial console cannot make
@@ -179,13 +194,14 @@ bool cbctl_serial_open(cbctl_serial_t *s, const char *path, unsigned baud)
         (void)nanosleep(&ts, NULL);
     }
     (void)tcflush(s->fd, TCIOFLUSH);
-
-    s->tx.ctx = s;
-    s->tx.send = ser_send;
-    s->tx.recv = ser_recv;
-    s->tx.mtu = CBPLC_STREAM_MAX;
     return true;
 }
+
+/* Deploy-verify fingerprint: `strings evse-controllerd | grep EVSE-USB-VTABLE`
+ * proves this file's fix is linked into a running binary. The usb-watchdog's
+ * destructive recovery rungs gate on exactly this marker before bouncing a bus
+ * under a controller that would crash on the reopen. */
+static const char cbctl_serial_vtable_fix[] __attribute__((used)) = "EVSE-USB-VTABLE-FIX-1";
 
 void cbctl_serial_close(cbctl_serial_t *s)
 {

@@ -181,12 +181,68 @@ TEST(a_framed_write_is_recovered_by_the_reader)
     (void)close(master);
 }
 
+/* THE CRASH ON THREE CHARGERS, AS A TEST.
+ *
+ * A USB hub drops; the port is closed for rebuild; the reopen races the hub's
+ * re-enumeration and loses — open(2) fails on a path that is briefly gone. The
+ * cbplc session still holds &s.tx from before the drop and polls through it two
+ * seconds later. The failed open must therefore leave a transport that is
+ * CALLABLE and answers "dead", never one whose function pointers were zeroed.
+ * Seeded with garbage so it is open() itself, not luck, that restores the
+ * invariant. */
+TEST(a_failed_open_leaves_a_callable_transport)
+{
+    cbctl_serial_t s;
+    uint8_t buf[8];
+    size_t len = 0u;
+
+    memset(&s, 0xAA, sizeof s);
+    CHECK(!cbctl_serial_open(&s, "/nonexistent/tty-gone-mid-reenumeration", 115200u));
+    CHECK(s.fd < 0);
+    CHECK(s.tx.send != NULL);
+    CHECK(s.tx.recv != NULL);
+    CHECK(s.tx.recv(s.tx.ctx, buf, sizeof buf, &len) == CBPLC_E_TRANSPORT);
+    CHECK(s.tx.send(s.tx.ctx, buf, 1u) == CBPLC_E_TRANSPORT);
+}
+
+/* Second, independent layer of the same fix: even if a future transport backend
+ * reintroduces a NULL vtable underneath a live session, cbplc_poll must report
+ * the transport dead rather than jump through it. */
+static cbplc_err_t dummy_send(void *ctx, const uint8_t *f, size_t l)
+{
+    (void)ctx; (void)f; (void)l;
+    return CBPLC_E_OK;
+}
+static cbplc_err_t dummy_recv(void *ctx, uint8_t *f, size_t cap, size_t *len)
+{
+    (void)ctx; (void)f; (void)cap;
+    *len = 0u;
+    return CBPLC_E_TIMEOUT;
+}
+TEST(poll_through_a_nulled_vtable_reports_transport_dead)
+{
+    cbplc_session_t p;
+    cbplc_transport_t tx;
+
+    memset(&tx, 0, sizeof tx);
+    tx.send = dummy_send;
+    tx.recv = dummy_recv;
+    tx.mtu = CBPLC_STREAM_MAX;
+    CHECK(cbplc_open(&p, &tx, NULL, NULL, NULL) == CBPLC_E_OK);
+    (void)cbplc_poll(&p, 0u); /* healthy baseline: reaching the next line is the check */
+    tx.send = NULL;
+    tx.recv = NULL;
+    CHECK(cbplc_poll(&p, 1u) == CBPLC_E_TRANSPORT);
+}
+
 int main(void)
 {
     printf("serial\n");
     RUN(a_full_transmit_buffer_never_blocks_the_caller);
     RUN(an_idle_port_reports_nothing_waiting_without_waiting);
     RUN(a_framed_write_is_recovered_by_the_reader);
+    RUN(a_failed_open_leaves_a_callable_transport);
+    RUN(poll_through_a_nulled_vtable_reports_transport_dead);
     if (g_fail) {
         printf("FAIL serial (%d)\n", g_fail);
         return 1;
