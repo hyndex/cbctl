@@ -185,6 +185,112 @@ TEST(the_relay_diagnostic_counters_are_readable)
     CHECK(cbctl_counter(&link, CBCTL_CTR_GUN_OPEN_TIMEOUTS) == 1u);
 }
 
+/* THE EVCCID IS THE OTHER VEHICLE IDENTITY, AND IT ARRIVES LATER THAN THE MAC.
+ *
+ * ISO 15118-2's is 6 bytes. It only exists once a V2G session has actually run, so unlike the
+ * MAC it is absent for a vehicle that never speaks HLC — and absent must read as absent. */
+TEST(the_evccid_arrives_with_the_session_and_is_readable)
+{
+    cbctl_link_t link;
+    cbctl_loopback_t lb;
+    uint32_t now = 1000u;
+    uint8_t id[CBCTL_EVCCID_MAX];
+    size_t idlen = 99u; /* poisoned: a refusal must clear it, not leave it */
+    static const uint8_t expect[6] = { 0x4Au, 0x5Bu, 0x6Cu, 0x7Du, 0x8Eu, 0x9Fu };
+
+    bring_up(&link, &lb, &now);
+    CHECK(!cbctl_evccid(&link, id, &idlen)); /* not known yet, and says so */
+    CHECK(idlen == 0u);                      /* and did not leave the poison behind */
+    CHECK(!cbctl_flag(&link, CBCTL_FLAG_EVCCID_KNOWN));
+
+    lb.cp = 'B';
+    lb.slac_matched = true;
+    lb.secc_active = true;
+    memcpy(lb.evcc_id, expect, 6u);
+    lb.evcc_id_len = 6u;
+    for (int i = 0; i < 6; i++) {
+        step(&link, &lb, &now, 600u);
+    }
+
+    CHECK(drain_for(&link, CBCTL_EV_EVCCID_KNOWN));
+    CHECK(cbctl_flag(&link, CBCTL_FLAG_EVCCID_KNOWN));
+    CHECK(cbctl_evccid(&link, id, &idlen));
+    CHECK(idlen == 6u);
+    CHECK(memcmp(id, expect, 6u) == 0);
+}
+
+/* A DIN 70121 EVCCID IS EIGHT BYTES, AND ALL EIGHT MUST SURVIVE.
+ *
+ * THE BUG THIS PINS: cbplc rendered a fixed six `%02X` off an eight-byte buffer, so every DIN
+ * vehicle's identity lost its last two bytes. A truncated identity is not a shorter identity —
+ * it is a DIFFERENT one, which collides with other vehicles and bills a car to the wrong
+ * account. Nothing on the wire said so; the field simply looked well-formed and was wrong. */
+TEST(a_din_evccid_keeps_all_eight_bytes)
+{
+    cbctl_link_t link;
+    cbctl_loopback_t lb;
+    uint32_t now = 1000u;
+    uint8_t id[CBCTL_EVCCID_MAX];
+    size_t idlen = 0u;
+    static const uint8_t expect[8] = { 0x01u, 0x23u, 0x45u, 0x67u,
+                                       0x89u, 0xABu, 0xCDu, 0xEFu };
+
+    bring_up(&link, &lb, &now);
+    lb.cp = 'B';
+    lb.secc_active = true;
+    memcpy(lb.evcc_id, expect, 8u);
+    lb.evcc_id_len = 8u;
+    for (int i = 0; i < 6; i++) {
+        step(&link, &lb, &now, 600u);
+    }
+
+    CHECK(cbctl_evccid(&link, id, &idlen));
+    CHECK(idlen == 8u);
+    CHECK(memcmp(id, expect, 8u) == 0);
+    /* The two bytes the old fixed-width rendering dropped, named individually so a
+     * regression reports WHICH end was lost rather than just "not equal". */
+    CHECK(id[6] == 0xCDu);
+    CHECK(id[7] == 0xEFu);
+}
+
+/* ZERO LENGTH IS "NO IDENTITY", NOT "AN IDENTITY OF ZEROES".
+ *
+ * cbplc clears the EVCCID when a session STARTS, so between sessions the field is present and
+ * empty. Without a length there would be no way to tell that from a vehicle whose id really is
+ * 00:00:...:00, and the caller would have to guess — about vehicle identity, which is the one
+ * place guessing bills the wrong account. The length removes the guess. */
+TEST(a_zero_length_evccid_is_absent_not_a_vehicle)
+{
+    cbctl_link_t link;
+    cbctl_loopback_t lb;
+    uint32_t now = 1000u;
+    uint8_t id[CBCTL_EVCCID_MAX];
+    size_t idlen = 0u;
+    static const uint8_t seen[6] = { 0xAAu, 0xBBu, 0xCCu, 0xDDu, 0xEEu, 0xFFu };
+
+    bring_up(&link, &lb, &now);
+    lb.cp = 'B';
+    lb.secc_active = true;
+    memcpy(lb.evcc_id, seen, 6u);
+    lb.evcc_id_len = 6u;
+    for (int i = 0; i < 6; i++) {
+        step(&link, &lb, &now, 600u);
+    }
+    CHECK(cbctl_evccid(&link, id, &idlen));
+
+    /* The session ends and the board clears its EVCCID, exactly as cbplc does at the START of
+     * the next one. The previous vehicle's identity must not still be readable. */
+    lb.evcc_id_len = 0u;
+    lb.secc_active = false;
+    for (int i = 0; i < 6; i++) {
+        step(&link, &lb, &now, 600u);
+    }
+    idlen = 77u;
+    CHECK(!cbctl_flag(&link, CBCTL_FLAG_EVCCID_KNOWN));
+    CHECK(!cbctl_evccid(&link, id, &idlen));
+    CHECK(idlen == 0u);
+}
+
 /* KEY MATCHING IS ANCHORED, NOT A SUBSTRING SEARCH.
  *
  * "stop" appears inside no key here by accident, but "ev_mac" IS a prefix of "ev_mac_ok" and
@@ -196,11 +302,16 @@ TEST(a_key_that_is_a_prefix_of_another_is_not_confused)
     cbctl_loopback_t lb;
     uint32_t now = 1000u;
     uint8_t mac[6];
+    uint8_t id[CBCTL_EVCCID_MAX];
+    size_t idlen = 0u;
     static const uint8_t expect[6] = { 0x11u, 0x22u, 0x33u, 0x44u, 0x55u, 0x66u };
+    static const uint8_t expect_id[6] = { 0xA1u, 0xB2u, 0xC3u, 0xD4u, 0xE5u, 0xF6u };
 
     bring_up(&link, &lb, &now);
     memcpy(lb.ev_mac, expect, 6u);
     lb.ev_mac_ok = true;
+    memcpy(lb.evcc_id, expect_id, 6u);
+    lb.evcc_id_len = 6u;
     lb.relay_safety_opens = 9u;
     lb.relay_lease_opens = 4u;
     for (int i = 0; i < 8; i++) {
@@ -215,6 +326,15 @@ TEST(a_key_that_is_a_prefix_of_another_is_not_confused)
     /* ev_mac read as the 12-hex value, NOT as ev_mac_ok's "1". */
     CHECK(cbctl_vehicle_mac(&link, mac));
     CHECK(memcmp(mac, expect, 6u) == 0);
+
+    /* THE SAME TRAP, ONE FIELD OVER. "evcc" is a prefix of "evcc_len", and the board emits
+     * evcc_len FIRST. An unanchored search for "evcc" finds evcc_len's value — the ASCII
+     * "6" — and reads a one-byte identity out of a length. Anchoring plus the required '='
+     * is what keeps them apart, and this asserts it on the real emitted ordering. */
+    CHECK(cbctl_evccid(&link, id, &idlen));
+    CHECK(idlen == 6u);
+    CHECK(memcmp(id, expect_id, 6u) == 0);
+
     /* And the two relay counters did not swap. */
     CHECK(cbctl_counter(&link, CBCTL_CTR_RELAY_SAFETY_OPENS) == 9u);
     CHECK(cbctl_counter(&link, CBCTL_CTR_RELAY_LEASE_OPENS) == 4u);
@@ -790,6 +910,84 @@ TEST(a_malformed_relay_mask_does_not_report_the_contactor_open)
     CHECK(link.relay_closed_mask == CBPLC_RELAY_GUN);
 }
 
+/* THE RAW-GENERATION CHAIN (2026-08-14): the board publishes pins, cbctl
+ * carries them verbatim AND derives the classified flag so every legacy
+ * consumer — the LED ranking above all — is generation-blind. */
+TEST(raw_safety_publishes_verbatim_and_derives_the_flag)
+{
+    cbctl_link_t link;
+    cbctl_loopback_t lb;
+    uint32_t now = 1000u;
+
+    bring_up(&link, &lb, &now);
+    lb.safety_raw_mode = true;
+    lb.safety_raw_mask = 0x01u; /* estop bit */
+    lb.safety_bus_unreadable = false;
+    for (int i = 0; i < 8; i++) {
+        step(&link, &lb, &now, 600u);
+    }
+    uint8_t mask = 0xFFu;
+    bool bus = true;
+    CHECK(cbctl_safety_raw(&link, &mask, &bus));
+    CHECK(mask == 0x01u);
+    CHECK(!bus);
+    CHECK(cbctl_flag(&link, CBCTL_FLAG_SAFETY_ASSERTED));
+
+    lb.safety_raw_mask = 0x00u;
+    for (int i = 0; i < 8; i++) {
+        step(&link, &lb, &now, 600u);
+    }
+    CHECK(cbctl_safety_raw(&link, &mask, &bus));
+    CHECK(mask == 0x00u);
+    CHECK(!cbctl_flag(&link, CBCTL_FLAG_SAFETY_ASSERTED));
+
+    /* An unreadable bus is an asserted chain whatever the mask says. */
+    lb.safety_bus_unreadable = true;
+    lb.safety_raw_mask = 0x1Fu;
+    for (int i = 0; i < 8; i++) {
+        step(&link, &lb, &now, 600u);
+    }
+    CHECK(cbctl_safety_raw(&link, &mask, &bus));
+    CHECK(bus);
+    CHECK(cbctl_flag(&link, CBCTL_FLAG_SAFETY_ASSERTED));
+}
+
+/* Legacy firmware never writes the raw fields; the accessor must say so
+ * rather than invent a mask, and the classified flag stays the legacy one. */
+TEST(legacy_firmware_reads_as_no_raw_fields)
+{
+    cbctl_link_t link;
+    cbctl_loopback_t lb;
+    uint32_t now = 1000u;
+
+    bring_up(&link, &lb, &now);
+    lb.safety_asserted = true;
+    for (int i = 0; i < 8; i++) {
+        step(&link, &lb, &now, 600u);
+    }
+    CHECK(!cbctl_safety_raw(&link, NULL, NULL));
+    CHECK(cbctl_flag(&link, CBCTL_FLAG_SAFETY_ASSERTED));
+}
+
+TEST(relay_drift_is_carried_with_its_readback)
+{
+    cbctl_link_t link;
+    cbctl_loopback_t lb;
+    uint32_t now = 1000u;
+
+    bring_up(&link, &lb, &now);
+    uint8_t rb = 0u;
+    CHECK(!cbctl_relay_drift(&link, &rb));
+
+    lb.relay_drifted = true;
+    lb.relay_drift_readback = 0x04u;
+    for (int i = 0; i < 8; i++) {
+        step(&link, &lb, &now, 600u);
+    }
+    CHECK(cbctl_relay_drift(&link, &rb));
+    CHECK(rb == 0x04u);
+}
+
 int main(void)
 {
     printf("status\n");
@@ -799,6 +997,9 @@ int main(void)
     RUN(a_session_total_is_not_a_live_session);
     RUN(a_board_reset_is_reported);
     RUN(the_relay_diagnostic_counters_are_readable);
+    RUN(the_evccid_arrives_with_the_session_and_is_readable);
+    RUN(a_din_evccid_keeps_all_eight_bytes);
+    RUN(a_zero_length_evccid_is_absent_not_a_vehicle);
     RUN(a_key_that_is_a_prefix_of_another_is_not_confused);
     RUN(a_truncated_status_is_rejected_rather_than_half_believed);
     RUN(a_silent_status_ages_the_snapshot_and_degrades_the_link);
@@ -815,6 +1016,9 @@ int main(void)
     RUN(an_unreadable_pilot_holds_its_vehicle_then_lets_go);
     RUN(an_estopped_pilot_faults_the_connector_and_retires_the_vehicle);
     RUN(a_malformed_relay_mask_does_not_report_the_contactor_open);
+    RUN(raw_safety_publishes_verbatim_and_derives_the_flag);
+    RUN(legacy_firmware_reads_as_no_raw_fields);
+    RUN(relay_drift_is_carried_with_its_readback);
     if (g_fail) {
         printf("FAIL status (%d)\n", g_fail);
         return 1;

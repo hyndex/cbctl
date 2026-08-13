@@ -136,12 +136,32 @@ static void plc_on_message(void *user, const cbplc_msg_t *msg, cbplc_err_t statu
          * the same space-separated key=value shape. Keeping the SHAPE honest is what makes
          * the parser test meaningful — including neighbours whose names share a tail, so a
          * substring match would be caught. */
-        char body[384];
+        /* The EVCCID, rendered to the length the fake was told to report — the same
+         * length-driven shape the firmware emits, because a fixed-width fake would let a
+         * consumer that assumes 6 bytes pass a test the real DIN wire would fail. */
+        char evcc_hex[2u * sizeof lb->evcc_id + 1u];
+        {
+            unsigned el = lb->evcc_id_len;
+            if (el > sizeof lb->evcc_id) { el = (unsigned)sizeof lb->evcc_id; }
+            for (unsigned i = 0u; i < el; ++i) {
+                snprintf(evcc_hex + 2u * i, 3u, "%02X", lb->evcc_id[i]);
+            }
+            evcc_hex[2u * el] = '\0';
+        }
+        char safety_kv[40];
+        if (lb->safety_raw_mode) {
+            snprintf(safety_kv, sizeof safety_kv, "safety_in=0x%02X safety_bus=%d",
+                     lb->safety_raw_mask, lb->safety_bus_unreadable ? 1 : 0);
+        } else {
+            snprintf(safety_kv, sizeof safety_kv, "safety=%d", lb->safety_asserted ? 1 : 0);
+        }
+        char body[448];
         const int n = snprintf(body, sizeof body,
             "cp=%c slac_matched=%d secc_active=%d secc_streams=%lu last_stop=1 stop=%d "
+            "evcc_len=%u evcc=%s "
             "ev_mac=%02X%02X%02X%02X%02X%02X ev_mac_ok=%d up_ms=%lu "
             "relay_safety_opens=%lu relay_lease_opens=%lu gun_open_timeouts=%lu "
-            "safety=%d relay_closed=0x%02X ev_soc=%u ev_ready=%d ev_pause=%d "
+            "%s relay_closed=0x%02X relay_drifted=%d relay_rb=0x%02X ev_soc=%u ev_ready=%d ev_pause=%d "
             "ev_tgt_mv=%lu ev_tgt_ma=%lu dc_ans=%lu "
             /* The TAIL KEY must match the firmware's real last field, or every parse here
              * reads as truncated — which is the truncation guard working, and exactly what
@@ -149,11 +169,13 @@ static void plc_on_message(void *user, const cbplc_msg_t *msg, cbplc_err_t statu
             "status_overflow=0 b1_dwell=1500 " CBCTL_STATUS_TAIL_KEY "=0",
             lb->cp ? lb->cp : 'A', lb->slac_matched ? 1 : 0, lb->secc_active ? 1 : 0,
             (unsigned long)lb->secc_streams, lb->stop_latched ? 1 : 0,
+            (unsigned)lb->evcc_id_len, evcc_hex,
             lb->ev_mac[0], lb->ev_mac[1], lb->ev_mac[2], lb->ev_mac[3], lb->ev_mac[4],
             lb->ev_mac[5], lb->ev_mac_ok ? 1 : 0, (unsigned long)lb->up_ms,
             (unsigned long)lb->relay_safety_opens, (unsigned long)lb->relay_lease_opens,
             (unsigned long)lb->gun_open_timeouts,
-            lb->safety_asserted ? 1 : 0, lb->relay_closed_mask,
+            safety_kv, lb->relay_closed_mask,
+            lb->relay_drifted ? 1 : 0, lb->relay_drift_readback,
             (unsigned)lb->ev_soc, lb->ev_ready ? 1 : 0, lb->ev_paused ? 1 : 0,
             (unsigned long)lb->ev_tgt_mv, (unsigned long)lb->ev_tgt_ma,
             (unsigned long)lb->dc_answers);
@@ -194,6 +216,8 @@ static void plc_on_message(void *user, const cbplc_msg_t *msg, cbplc_err_t statu
             if (cbplc_limits_apply_measurement(&dl, msg->payload, msg->payload_len, 1u)
                     == CBPLC_E_OK) {
                 lb->last_feedback_contactor = (uint8_t)dl.measurement.contactor;
+                lb->last_feedback_voltage_mv = dl.measurement.present_voltage_mv;
+                lb->last_feedback_current_ma = dl.measurement.present_current_ma;
             }
         }
         lb->feedback_seen++;

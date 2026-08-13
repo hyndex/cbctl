@@ -116,6 +116,32 @@ bool cbctl_flag(const cbctl_link_t *link, cbctl_flag_t f)
     return link->flags[f];
 }
 
+bool cbctl_safety_raw(const cbctl_link_t *link, uint8_t *mask, bool *bus_unreadable)
+{
+    if (link == NULL || !link->safety_raw_valid) {
+        return false;
+    }
+    if (mask != NULL) {
+        *mask = link->safety_raw_mask;
+    }
+    if (bus_unreadable != NULL) {
+        *bus_unreadable = link->safety_bus_unreadable != 0u;
+    }
+    return true;
+}
+
+bool cbctl_relay_drift(const cbctl_link_t *link, uint8_t *readback)
+{
+    if (link == NULL || !link->relay_drifted) {
+        return false;
+    }
+    if (readback != NULL) {
+        *readback = link->relay_drift_readback;
+    }
+    return true;
+}
+
+
 uint32_t cbctl_counter(const cbctl_link_t *link, cbctl_counter_t c)
 {
     if (link == NULL || (unsigned)c >= (unsigned)CBCTL_CTR__COUNT) {
@@ -165,6 +191,31 @@ bool cbctl_vehicle_mac(const cbctl_link_t *link, uint8_t out[6])
         return false;
     }
     memcpy(out, link->ev_mac, 6u);
+    return true;
+}
+
+bool cbctl_evccid(const cbctl_link_t *link, uint8_t out[CBCTL_EVCCID_MAX], size_t *out_len)
+{
+    /* *out_len is cleared on EVERY refusal path, not just the ones that fail late. A caller
+     * that checks the return value is fine either way; one that reads the length first — the
+     * natural shape for a variable-length identity — would otherwise act on whatever was in
+     * its stack slot, and act on it as a vehicle's identity. */
+    if (out_len != NULL) {
+        *out_len = 0u;
+    }
+    if (link == NULL || out == NULL || out_len == NULL ||
+        !link->flags[CBCTL_FLAG_EVCCID_KNOWN]) {
+        return false;
+    }
+    /* Defence in depth against a stored length that outran the buffer. The parser already
+     * refuses anything above CBCTL_EVCCID_MAX, so this cannot fire today — and it is here
+     * precisely because that is the kind of guarantee a later edit removes without noticing
+     * that a memcpy two files away depended on it. */
+    if (link->evcc_id_len == 0u || link->evcc_id_len > CBCTL_EVCCID_MAX) {
+        return false;
+    }
+    memcpy(out, link->evcc_id, (size_t)link->evcc_id_len);
+    *out_len = (size_t)link->evcc_id_len;
     return true;
 }
 
@@ -353,6 +404,47 @@ void cbctl_status_apply(cbctl_link_t *link, const uint8_t *payload, size_t len, 
     if (u32_field(buf, len, "safety", &v)) {
         now_flags[CBCTL_FLAG_SAFETY_ASSERTED] = (v != 0u);
     }
+    /* Raw-publishing firmware (2026-08-14 onward) drops `safety=` and sends the
+     * pins verbatim. The classified flag is DERIVED here so every downstream
+     * consumer — the LED ranking above all — keeps working across both
+     * generations: an unreadable bus or any asserted bit is an asserted chain.
+     * Same hex discipline as relay_closed below: unparseable applies nothing. */
+    {
+        size_t rl = 0u;
+        const char *rp = field(buf, len, "safety_in", &rl);
+        unsigned mask = 0u;
+        bool ok = (rp != NULL && rl >= 3u && rp[0] == '0' && (rp[1] == 'x' || rp[1] == 'X'));
+        for (size_t k = 2u; ok && k < rl; k++) {
+            const int nib = hex_nibble(rp[k]);
+            if (nib < 0) { ok = false; break; }
+            mask = (mask << 4) | (unsigned)nib;
+        }
+        if (ok) {
+            uint32_t bus = 1u; /* absent bus flag on a raw line: assume unreadable */
+            (void)u32_field(buf, len, "safety_bus", &bus);
+            link->safety_raw_mask = (uint8_t)mask;
+            link->safety_bus_unreadable = (bus != 0u) ? 1u : 0u;
+            link->safety_raw_valid = 1u;
+            now_flags[CBCTL_FLAG_SAFETY_ASSERTED] = (mask != 0u) || (bus != 0u);
+        }
+    }
+    if (u32_field(buf, len, "relay_drifted", &v)) {
+        link->relay_drifted = (v != 0u) ? 1u : 0u;
+    }
+    {
+        size_t rl = 0u;
+        const char *rp = field(buf, len, "relay_rb", &rl);
+        unsigned mask = 0u;
+        bool ok = (rp != NULL && rl >= 3u && rp[0] == '0' && (rp[1] == 'x' || rp[1] == 'X'));
+        for (size_t k = 2u; ok && k < rl; k++) {
+            const int nib = hex_nibble(rp[k]);
+            if (nib < 0) { ok = false; break; }
+            mask = (mask << 4) | (unsigned)nib;
+        }
+        if (ok) {
+            link->relay_drift_readback = (uint8_t)mask;
+        }
+    }
     /* relay_closed is a hex mask; a closed GUN bit is the board saying the contactor is in.
      *
      * A VALUE WE CANNOT PARSE IS NOT "EVERY RELAY IS OPEN". The malformed-digit path used to set
@@ -399,6 +491,46 @@ void cbctl_status_apply(cbctl_link_t *link, const uint8_t *payload, size_t len, 
         }
         if (ok) {
             memcpy(link->ev_mac, mac, 6u);
+        }
+    }
+
+    /* --- the vehicle EVCCID, length-prefixed hex ---
+     *
+     * TWO FIELDS, AND THE LENGTH IS THE ONE THAT DECIDES. `evcc_len` says how many bytes the
+     * vehicle supplied — 6 for ISO 15118-2, 8 for DIN 70121 — and `evcc` carries exactly that
+     * many bytes of hex. Gating on the length rather than on the value is what keeps "no
+     * EVCCID this session" distinct from "an EVCCID of all zeros"; the board publishes
+     * evcc_len=0 from session start until a SessionSetupReq supplies one.
+     *
+     * A BOARD TOO OLD TO SEND EITHER KEY leaves the flag clear, because now_flags starts
+     * zeroed and only a present field sets it. Unknown, never a phantom identity.
+     *
+     * `evcc` cannot be found inside `evcc_len` even though it is a prefix of it: field()
+     * anchors on a preceding space AND requires '=' immediately after the key, which is the
+     * same guard that keeps "ev_mac" out of "ev_mac_ok". Both halves are pinned by tests.
+     *
+     * A LENGTH WE BELIEVE BUT HEX WE CANNOT PARSE APPLIES NEITHER. Half an identity is worse
+     * than none: it would be a DIFFERENT vehicle's id as far as any table is concerned. */
+    if (u32_field(buf, len, "evcc_len", &v) && v > 0u && v <= CBCTL_EVCCID_MAX) {
+        p = field(buf, len, "evcc", &vlen);
+        if (p != NULL && vlen == (size_t)v * 2u) {
+            uint8_t id[CBCTL_EVCCID_MAX];
+            bool ok = true;
+            for (i = 0u; i < (unsigned)v; i++) {
+                const int hi = hex_nibble(p[i * 2u]);
+                const int lo = hex_nibble(p[(i * 2u) + 1u]);
+                if (hi < 0 || lo < 0) {
+                    ok = false;
+                    break;
+                }
+                id[i] = (uint8_t)((hi << 4) | lo);
+            }
+            if (ok) {
+                memset(link->evcc_id, 0, sizeof link->evcc_id);
+                memcpy(link->evcc_id, id, (size_t)v);
+                link->evcc_id_len = (uint8_t)v;
+                now_flags[CBCTL_FLAG_EVCCID_KNOWN] = true;
+            }
         }
     }
 
@@ -499,6 +631,9 @@ void cbctl_status_apply(cbctl_link_t *link, const uint8_t *payload, size_t len, 
         if (now_flags[CBCTL_FLAG_VEHICLE_MAC_KNOWN] &&
             !link->flags[CBCTL_FLAG_VEHICLE_MAC_KNOWN]) {
             push_event(link, CBCTL_EV_VEHICLE_MAC_KNOWN, now_ms);
+        }
+        if (now_flags[CBCTL_FLAG_EVCCID_KNOWN] && !link->flags[CBCTL_FLAG_EVCCID_KNOWN]) {
+            push_event(link, CBCTL_EV_EVCCID_KNOWN, now_ms);
         }
         if (now_flags[CBCTL_FLAG_SESSION_ACTIVE] && !link->flags[CBCTL_FLAG_SESSION_ACTIVE]) {
             push_event(link, CBCTL_EV_SESSION_STARTED, now_ms);

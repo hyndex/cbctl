@@ -56,6 +56,14 @@ typedef struct {
     bool     stop_latched;
     bool     ev_mac_ok;
     bool     safety_asserted;
+    /* Raw-generation firmware (2026-08-14 onward): render safety_in/safety_bus
+     * instead of the classified safety= key. Off by default so existing tests
+     * keep exercising the legacy line. */
+    bool     safety_raw_mode;
+    uint8_t  safety_raw_mask;
+    bool     safety_bus_unreadable;
+    bool     relay_drifted;
+    uint8_t  relay_drift_readback;
     uint8_t  relay_closed_mask;
     uint32_t dc_answers;    /* mirrors cbplc's dc_ans */
     bool     ev_demand_idle;/* set to stop answering: models a vehicle that has gone quiet */
@@ -64,6 +72,11 @@ typedef struct {
     bool     ev_ready;
     bool     ev_paused;
     uint8_t  ev_mac[6];
+    /* The EVCCID the fake board reports. evcc_id_len drives everything: 0 is the honest
+     * "no V2G session has supplied one", 6 models ISO 15118-2 and 8 models DIN 70121 —
+     * and a test that sets 8 is the only thing that catches a consumer assuming 6. */
+    uint8_t  evcc_id[8];
+    uint8_t  evcc_id_len;
     uint8_t  board_mac[6];   /* what IDENTITY reports; change it to model a swapped board */
     uint32_t secc_streams;
     uint32_t up_ms;
@@ -120,6 +133,11 @@ typedef struct {
      * had an opinion" is a safety question, not a curiosity. */
     int      first_auth_decision;
     uint8_t  last_feedback_contactor;
+    /* What the controller actually put on the wire as the present measurement, so a test can
+     * tell a live feed from a replayed cache. The number the vehicle eventually reads during
+     * WeldingDetection descends directly from this. */
+    uint32_t last_feedback_voltage_mv;
+    uint32_t last_feedback_current_ma;
     unsigned status_seen;
     unsigned stop_seen;
 } cbctl_loopback_t;

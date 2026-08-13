@@ -29,6 +29,13 @@ void push_quarantine_event(cbctl_link_t *link, uint32_t now_ms);
  * session. That margin is the reason for the number; do not raise it without redoing the
  * arithmetic in docs/03-concurrency-and-fleet.md section 5. */
 #define CBCTL_FEED_PERIOD_MS 400u
+
+/* How many consecutive FEEDBACK sends may carry a value the caller has not refreshed before
+ * the numbers fall to zero. Two, so the cache can never outlive ~2 x CBCTL_FEED_PERIOD_MS
+ * (~800 ms). The controller declares at >= 5 Hz, so a healthy feed refreshes roughly twice
+ * per send and never approaches this; a caller that has genuinely stopped is caught well
+ * inside cbplc's 1500 ms weld settle window, which is the deadline that actually matters. */
+#define CBCTL_MEASUREMENT_MAX_IDLE_FEEDS 2u
 #define CBCTL_HEARTBEAT_PERIOD_MS 400u
 /* Observation, not liveness. Slower than the feed on purpose: STATUS is a large message and
  * must never delay LIMITS/FEEDBACK, which are what hold permission to energise. */
@@ -538,6 +545,10 @@ cbctl_status_t cbctl_set_measurement(cbctl_link_t *link, const cbctl_measurement
     }
     link->measurement = *m;
     link->have_measurement = true;
+    /* The caller has supplied a value, so the next send may carry it. Without this the send
+     * path cannot tell a live feed from a caller that stopped calling — see the field's
+     * comment in cbctl.h for why replaying a mid-charge reading freezes vehicles. */
+    link->measurement_refreshed = true;
     return CBCTL_OK;
 }
 
@@ -980,8 +991,26 @@ static bool issue_one(cbctl_link_t *link, cbctl_instant_t now)
         (link->measurement_dirty || due(now, link->last_feedback, CBCTL_FEED_PERIOD_MS))) {
         cbplc_measurement_t m;
         memset(&m, 0, sizeof m);
-        m.present_voltage_mv = cbctl_mv(link->measurement.present_voltage);
-        m.present_current_ma = cbctl_ma(link->measurement.present_current);
+        /* BOUNDED REPLAY. See cbctl.h on measurement_refreshed: the stored value is only a
+         * live measurement for as long as the caller keeps supplying it. Past the cap the
+         * numbers go to zero rather than presenting a cached mid-charge reading to the board
+         * as current — which is what the vehicle reads during WeldingDetection.
+         *
+         * The ISOLATION verdict is deliberately NOT zeroed with them. It is a discrete
+         * safety verdict rather than a sampled quantity, it does not decay, and blanking it
+         * would clear EVSEIsolationStatus_isUsed on the wire and stall a DIN vehicle. */
+        if (link->measurement_refreshed) {
+            link->measurement_idle_feeds = 0u;
+            link->measurement_refreshed = false;
+        } else if (link->measurement_idle_feeds < CBCTL_MEASUREMENT_MAX_IDLE_FEEDS) {
+            link->measurement_idle_feeds++;
+        }
+        const bool measurement_expired =
+            link->measurement_idle_feeds >= CBCTL_MEASUREMENT_MAX_IDLE_FEEDS;
+        m.present_voltage_mv =
+            measurement_expired ? 0u : cbctl_mv(link->measurement.present_voltage);
+        m.present_current_ma =
+            measurement_expired ? 0u : cbctl_ma(link->measurement.present_current);
         m.isolation = (uint8_t)link->measurement.isolation;
         /* THE CONTACTOR IS DERIVED, NOT SUPPLIED — and it used to be neither.
          *

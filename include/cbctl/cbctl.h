@@ -164,6 +164,14 @@ extern "C" {
 #define CBCTL_AUTH_PERIOD_FLOOR_MS 500u
 #endif
 
+/* Longest EVCCID this library will report — see cbctl_evccid().
+ *
+ * DIN 70121's EVCCID is 8 bytes and ISO 15118-2's is 6, so 8 is a wire fact rather than a
+ * round number, and it matches cbplc's own evcc_id[8]. NOT #ifndef-guarded, unlike the
+ * tunables above: a port that shrank this would silently truncate a DIN vehicle's identity
+ * into a different vehicle's, which is not a local policy choice to make. */
+#define CBCTL_EVCCID_MAX 8u
+
 /* Shortest AUTHORIZE lease that cannot be lapsed by one unanswered request, derived from the
  * same blocking budget as the relay hold. Refused rather than raised: unlike a relay hold —
  * where a longer dead-man is merely less safe and silently raising it keeps the contactor
@@ -359,6 +367,13 @@ typedef enum {
      * board that boots with a car already on the gun publishes E, and this flag reads true, for
      * a second or two. That is honest; it is also the only case where it is self-inflicted. */
     CBCTL_FLAG_PILOT_FAULT,
+    /* An EVCCID has been reported for the CURRENT session — see cbctl_evccid().
+     *
+     * Appended rather than placed beside CBCTL_FLAG_VEHICLE_MAC_KNOWN, where it belongs
+     * by meaning, because these values index a bool array a caller may have persisted or
+     * compared across a version boundary, and renumbering the flags in the middle would
+     * silently move every one after it. */
+    CBCTL_FLAG_EVCCID_KNOWN,
     CBCTL_FLAG__COUNT
 } cbctl_flag_t;
 
@@ -425,7 +440,11 @@ typedef enum {
     CBCTL_EV_LINK_QUARANTINED,
     /* We commanded a relay closed, the board accepted it, and its own safety layer opened it
      * again — repeatedly. cbctl has abandoned the close rather than keep re-commanding it. */
-    CBCTL_EV_RELAY_OVERRIDDEN
+    CBCTL_EV_RELAY_OVERRIDDEN,
+    /* The vehicle's EVCCID arrived — see cbctl_evccid(). The LATER autocharge trigger: it
+     * needs a V2G session, so it lands well after CBCTL_EV_VEHICLE_MAC_KNOWN and only for
+     * a vehicle that actually speaks HLC. Appended for the same ABI reason as the flag. */
+    CBCTL_EV_EVCCID_KNOWN
 } cbctl_event_kind_t;
 
 typedef struct {
@@ -482,6 +501,24 @@ typedef struct {
      * PERMANENTLY due — which starved every lower-priority message, including the relay lease
      * renewal, and the board opened the contactor on a lapsed dead-man. */
     bool                envelope_dirty, measurement_dirty, auth_dirty;
+
+    /* THE MEASUREMENT MAY BE REPLAYED, BUT ONLY BRIEFLY.
+     *
+     * The periodic send carries whatever value is stored, which is correct while the caller
+     * keeps refreshing it and DANGEROUS the moment it stops: the last number the controller
+     * ever supplied was taken mid-CurrentDemand with the contactor closed and hundreds of
+     * volts on the bus, and replaying it forever presents that reading to the board — and
+     * through it to the vehicle — as a live measurement. During WeldingDetection the car is
+     * reading exactly this number to decide whether OUR contactor welded shut. A stale
+     * mid-charge voltage there is the welded signature: HV-critical fault, frozen vehicle.
+     *
+     * So a replay is bounded. `measurement_refreshed` records that the caller supplied a
+     * value since the last send; `measurement_idle_feeds` counts consecutive sends without
+     * one, and past the cap the transmitted present voltage/current fall to zero. Zero is the
+     * safe under-claim: a vehicle reading 0 V concludes nothing is welded and unlatches.
+     * The stored measurement itself is left intact so a single refresh restores the truth. */
+    bool                measurement_refreshed;
+    uint8_t             measurement_idle_feeds;
 
     /* When each declaration was last put on the wire, so the tick knows what is due. */
     cbctl_instant_t last_limits, last_feedback, last_heartbeat, last_auth;
@@ -584,6 +621,16 @@ typedef struct {
     uint32_t ev_target_ms;   /* when the board last ANSWERED a DC request — the liveness stamp */
     uint32_t dc_answers;     /* cbplc's dc_ans: rises only while the vehicle is asking */
     uint8_t  relay_closed_mask;
+    /* The raw safety chain, verbatim from safety_in/safety_bus (firmware that
+     * publishes raw only, 2026-08-14 onward). safety_raw_valid says the board
+     * publishes them at all — legacy firmware does not, and absent is absent. */
+    uint8_t  safety_raw_mask;
+    uint8_t  safety_bus_unreadable;   /* bool */
+    uint8_t  safety_raw_valid;        /* bool: the two fields above are live */
+    /* Relay expander drift, verbatim from relay_drifted/relay_rb. Detection is
+     * the board's; policy is the controller's. */
+    uint8_t  relay_drifted;           /* bool */
+    uint8_t  relay_drift_readback;
 
     /* Raw STATUS observer. NULL by default; set it and every status payload the board sends is
      * handed over verbatim before any parsing.
@@ -625,6 +672,11 @@ typedef struct {
     uint32_t pilot_blind_since_ms;
     uint32_t counters[CBCTL_CTR__COUNT];
     uint8_t  ev_mac[6];
+    /* The EVCCID and the length the board reported for it. Stored together because the
+     * length IS part of the identity here — see cbctl_evccid(). Kept beside ev_mac because
+     * they are the two vehicle identities, and a reader looking for one wants the other. */
+    uint8_t  evcc_id[CBCTL_EVCCID_MAX];
+    uint8_t  evcc_id_len;
     /* TWO stamps, deliberately. `last_status_req` is when we ASKED and drives the request
      * cadence; `last_status` is when a reply was PARSED and answers "how current is what we
      * believe". Driving the cadence from the reply made each round trip's latency compound
@@ -766,6 +818,16 @@ uint8_t cbctl_op_gate(const cbctl_link_t *link, cbctl_op_t op);
 uint32_t cbctl_next_deadline_ms(const cbctl_link_t *link, uint32_t now_ms);
 
 bool     cbctl_flag(const cbctl_link_t *link, cbctl_flag_t f);
+
+/* The raw safety chain as the board publishes it. Returns false on firmware
+ * that predates raw publication (the fields are then not written) — the
+ * caller falls back to the classified flags. Bit order: estop, earth,
+ * insulation, fuse_spd, ac_voltage. */
+bool     cbctl_safety_raw(const cbctl_link_t *link, uint8_t *mask, bool *bus_unreadable);
+
+/* Expander drift as the board reports it: relay state unknown until a
+ * verified write agrees. `readback` is the disagreeing byte, naming the pin. */
+bool     cbctl_relay_drift(const cbctl_link_t *link, uint8_t *readback);
 uint32_t cbctl_counter(const cbctl_link_t *link, cbctl_counter_t c);
 
 /* The EV's HomePlug MAC, known at SLAC MATCH — before any V2G session exists and therefore
@@ -776,6 +838,31 @@ uint32_t cbctl_counter(const cbctl_link_t *link, cbctl_counter_t c);
  * EVCCID: a 6-byte MAC and an 8-byte contract identifier are different identities, and
  * conflating them is how a car gets billed to the wrong account. */
 bool cbctl_vehicle_mac(const cbctl_link_t *link, uint8_t out[6]);
+
+/* The vehicle's EVCCID from SessionSetupReq — the identity ISO 15118 gives a car, and the
+ * second thing a controller can autocharge on.
+ *
+ * THE OTHER CALL, AND WHY IT IS A DIFFERENT ONE. cbctl_vehicle_mac() answers at SLAC MATCH,
+ * before any V2G session exists. This answers only once HLC has actually run, so it is later
+ * and it is absent entirely for a vehicle that never speaks it. Two calls, two types, two
+ * lengths — the header above says why conflating them bills a car to the wrong account, and
+ * that reasoning is the reason this is not an out-parameter on the same function.
+ *
+ * VARIABLE LENGTH, AND THE LENGTH IS PART OF THE IDENTITY. `*out_len` is set to the byte
+ * count the board reported, which is 6 for ISO and 8 for DIN. A caller that assumes 6 and
+ * truncates a DIN identity has not read a shorter identity — it has read a DIFFERENT one,
+ * which collides with other vehicles. Fill `out` to CBCTL_EVCCID_MAX and honour *out_len.
+ *
+ * SESSION-SCOPED, unlike the MAC. cbplc clears its EVCCID when a session STARTS and
+ * publishes evcc_len=0 until a vehicle supplies one, so this reads false between sessions
+ * rather than echoing the last car — the same hazard cbctl_ev_target() and
+ * cbctl_ev_soc_pct() document, handled at the source here rather than by a gate on this
+ * side.
+ *
+ * A BOARD TOO OLD TO PUBLISH IT reads false forever, never a phantom: the flag is set only
+ * by a present, non-zero evcc_len field, so a missing key is "unknown", never "known to be
+ * empty". Returns false and leaves *out_len 0 when there is nothing to report. */
+bool cbctl_evccid(const cbctl_link_t *link, uint8_t out[CBCTL_EVCCID_MAX], size_t *out_len);
 
 /* The EV's state of charge in percent, or -1 when the vehicle has not reported one.
  *

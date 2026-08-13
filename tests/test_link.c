@@ -622,6 +622,64 @@ TEST(only_a_real_change_marks_the_feed_dirty)
     CHECK(link.measurement_dirty);
 }
 
+/* A CACHED MID-CHARGE READING MUST NOT BE REPLAYED FOREVER.
+ *
+ * The periodic send carries whatever value is stored, which is right while the caller keeps
+ * supplying one and dangerous the moment it stops. The last measurement a controller ever
+ * declares is taken mid-CurrentDemand: contactor closed, hundreds of volts on the bus. Replaying
+ * that indefinitely presents it to the board — and through it to the vehicle — as a live reading.
+ *
+ * During WeldingDetection the car reads exactly this number with its own contactors open, to
+ * decide whether OURS welded shut. A stale 400 V there IS the welded signature: HV-critical
+ * fault, and vehicles that freeze until a dealer clears them. Zero is the safe under-claim.
+ */
+TEST(a_measurement_the_caller_stopped_refreshing_decays_to_zero)
+{
+    cbctl_link_t link;
+    cbctl_loopback_t lb;
+    uint32_t now = 1000u;
+
+    bring_up(&link, &lb, &now);
+
+    cbctl_measurement_t m;
+    memset(&m, 0, sizeof m);
+    m.present_voltage = CBCTL_MV(400000u);
+    m.present_current = CBCTL_MA(50000u);
+    m.isolation = CBCTL_ISO_VALID;
+
+    /* A LIVE FEED: the caller re-declares every pass, exactly as the controller's tick does.
+     * The real number must reach the board unmodified for as long as that holds. */
+    for (int i = 0; i < 40; i++) {
+        CHECK(cbctl_set_measurement(&link, &m) == CBCTL_OK);
+        round_trip(&link, &lb, &now, 100u);
+    }
+    CHECK(lb.last_feedback_voltage_mv == 400000u);
+    CHECK(lb.last_feedback_current_ma == 50000u);
+
+    /* THE CALLER NOW STOPS. Nothing else changes: the link is healthy, the board is answering,
+     * and cbctl keeps its feed cadence. Only the refresh has gone away. */
+    const unsigned before = lb.feedback_seen;
+    for (int i = 0; i < 40; i++) {
+        round_trip(&link, &lb, &now, 100u);
+    }
+    CHECK(lb.feedback_seen > before);              /* the feed is still running ... */
+    CHECK(lb.last_feedback_voltage_mv == 0u);      /* ... but no longer carrying the cache */
+    CHECK(lb.last_feedback_current_ma == 0u);
+
+    /* AND IT IS A DECAY, NOT A LATCH. The stored measurement was never discarded, only
+     * withheld, so a caller that resumes declaring is believed again immediately.
+     *
+     * Note the refresh is inside the loop, which is the contract: one lone call buys about
+     * two feed periods, not indefinite trust. That is the whole point — a cache with an
+     * expiry is only safe if the expiry cannot be reset by a caller that has since died. */
+    for (int i = 0; i < 12; i++) {
+        CHECK(cbctl_set_measurement(&link, &m) == CBCTL_OK);
+        round_trip(&link, &lb, &now, 100u);
+    }
+    CHECK(lb.last_feedback_voltage_mv == 400000u);
+    CHECK(lb.last_feedback_current_ma == 50000u);
+}
+
 /* AN UNANSWERED REQUEST MUST NOT LAPSE THE RELAY LEASE.
  *
  * cbplc is stop-and-wait, so one request the board ignores blocks EVERY other message for the
@@ -1721,6 +1779,7 @@ int main(void)
     RUN(provisioning_is_silent_until_something_is_declared);
     RUN(a_declaration_reaches_the_board_and_is_confirmed);
     RUN(re_declaring_the_same_values_sends_nothing);
+    RUN(a_measurement_the_caller_stopped_refreshing_decays_to_zero);
     RUN(a_board_reset_re_asserts_the_identity);
     RUN(an_out_of_schema_evse_id_never_reaches_the_wire);
     RUN(a_firmware_that_predates_provisioning_is_detected_not_argued_with);

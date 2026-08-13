@@ -86,6 +86,16 @@ POWSRC := tools/power_cbm.cpp $(CBMOD)/src/module_manager.cpp $(wildcard $(CBMET
           $(wildcard $(CBMET)/src/drivers/*.cpp)
 POWINC := -I$(CBMOD)/include -I$(CBMET)/include
 
+# module_one drives ONE address, so two instances at DIFFERENT voltages prove
+# which meter loop belongs to which gun. Same driver set as module_selftest.
+module-one: $(BUILD)/module_one
+$(BUILD)/module_one: tools/module_one.c $(POWSRC)
+	@mkdir -p $(BUILD)/pow
+	$(CXX) -std=c++17 $(OPT) $(POWINC) -c $(POWSRC)
+	@mv -f *.o $(BUILD)/pow/ 2>/dev/null || true
+	$(CC) $(CFLAGS) -c $< -o $(BUILD)/module_one.o
+	$(CXX) $(BUILD)/module_one.o $(BUILD)/pow/*.o -o $@
+
 selftest: $(BUILD)/module_selftest
 $(BUILD)/module_selftest: tools/module_selftest.c $(POWSRC)
 	@mkdir -p $(BUILD)/pow
