@@ -160,6 +160,130 @@ TEST(a_quarantined_link_is_faulted_not_available)
     CHECK(cbctl_led_preset(&l, n) == CBCTL_LED_FAULTED);
 }
 
+/* Raw-generation firmware: the ranking is the strip's, in the strip's order. Only the e-stop
+ * bit earns EMERGENCY; a protection trip is FAULTED; a blind bus is FAULTED even though the
+ * fail-safe fill asserts the e-stop bit — pessimism about the contactors is not a person. */
+TEST(raw_safety_ranks_like_the_strip)
+{
+    cbctl_link_t l;
+    cbctl_loopback_t b;
+    uint32_t n = 1000u;
+
+    up(&l, &b, &n);
+    b.safety_raw_mode = true;
+
+    b.safety_raw_mask = 0x02u; /* earth fault, no e-stop */
+    settle(&l, &b, &n);
+    CHECK(cbctl_led_preset(&l, n) == CBCTL_LED_FAULTED);
+
+    b.safety_raw_mask = 0x01u; /* the e-stop bit, and only it */
+    settle(&l, &b, &n);
+    CHECK(cbctl_led_preset(&l, n) == CBCTL_LED_EMERGENCY);
+
+    b.safety_raw_mask = 0x1Fu; /* the all-asserted fill behind an unreadable bus */
+    b.safety_bus_unreadable = true;
+    settle(&l, &b, &n);
+    CHECK(cbctl_led_preset(&l, n) == CBCTL_LED_FAULTED);
+
+    b.safety_raw_mask = 0x00u;
+    b.safety_bus_unreadable = false;
+    settle(&l, &b, &n);
+    CHECK(cbctl_led_preset(&l, n) == CBCTL_LED_AVAILABLE);
+}
+
+/* A drifted expander cannot close a contactor — the board's latch refuses every close and
+ * its strip blinks FAULTED. Falling through to AVAILABLE here was an invitation to plug
+ * into a connector that cannot be driven. */
+TEST(a_drifted_expander_is_faulted_not_available)
+{
+    cbctl_link_t l;
+    cbctl_loopback_t b;
+    uint32_t n = 1000u;
+
+    up(&l, &b, &n);
+    CHECK(cbctl_led_preset(&l, n) == CBCTL_LED_AVAILABLE);
+
+    b.relay_drifted = true;
+    b.relay_drift_readback = 0x01u;
+    settle(&l, &b, &n);
+    CHECK(cbctl_led_preset(&l, n) == CBCTL_LED_FAULTED);
+}
+
+/* The board's own charge machine names CHARGING/FINISHING/FAULTED when it is published.
+ * The proxies disagreed on every session: the gun contactor closes for CableCheck tens of
+ * seconds before energy flows, a vehicle stop never touches the controller's latch, and a
+ * fault with the vehicle still plugged fell through to PREPARING. */
+TEST(the_boards_charge_machine_names_the_preset)
+{
+    cbctl_link_t l;
+    cbctl_loopback_t b;
+    uint32_t n = 1000u;
+
+    up(&l, &b, &n);
+    b.cp = 'B';
+    b.slac_matched = true;
+    b.secc_active = true;
+    b.relay_closed_mask = CBPLC_RELAY_GUN; /* CableCheck: contactor in, no energy yet */
+    b.session_state = "Negotiating";
+    settle(&l, &b, &n);
+    CHECK(cbctl_led_preset(&l, n) != CBCTL_LED_CHARGING);
+    CHECK(cbctl_led_preset(&l, n) == CBCTL_LED_PREPARING);
+
+    b.session_state = "Energised";
+    settle(&l, &b, &n);
+    CHECK(cbctl_led_preset(&l, n) == CBCTL_LED_CHARGING);
+
+    /* The vehicle stops the charge itself: stop= stays 0, only session= says so. */
+    b.session_state = "Stopping";
+    settle(&l, &b, &n);
+    CHECK(cbctl_led_preset(&l, n) == CBCTL_LED_FINISHING);
+
+    b.session_state = "Fault";
+    b.secc_active = false;
+    b.relay_closed_mask = 0u;
+    settle(&l, &b, &n);
+    CHECK(cbctl_led_preset(&l, n) == CBCTL_LED_FAULTED); /* not PREPARING: no charge is coming */
+}
+
+/* An OTA rollback swaps a raw-generation board for a legacy one on the SAME live link —
+ * same MAC, reset absorbed, no reopen. The raw snapshot from before the rollback is now a
+ * frozen lie; the first legacy safety= line must retire it, or a legacy-published e-stop
+ * renders AVAILABLE off a stale clear raw mask. */
+TEST(a_firmware_downgrade_retires_the_raw_snapshot)
+{
+    cbctl_link_t l;
+    cbctl_loopback_t b;
+    uint32_t n = 1000u;
+
+    up(&l, &b, &n);
+    b.safety_raw_mode = true;
+    b.safety_raw_mask = 0x00u; /* raw generation, chain clear */
+    settle(&l, &b, &n);
+    CHECK(cbctl_led_preset(&l, n) == CBCTL_LED_AVAILABLE);
+
+    b.safety_raw_mode = false;  /* the rollback: classified generation again */
+    b.safety_asserted = true;   /* and its e-stop is pressed */
+    settle(&l, &b, &n);
+    CHECK(cbctl_led_preset(&l, n) == CBCTL_LED_EMERGENCY);
+}
+
+/* A name this build does not know degrades to the proxy ranking — it must never impersonate
+ * a known state, and it must never block the fallback for boards that predate session=. */
+TEST(an_unknown_charge_state_degrades_to_the_proxies)
+{
+    cbctl_link_t l;
+    cbctl_loopback_t b;
+    uint32_t n = 1000u;
+
+    up(&l, &b, &n);
+    b.cp = 'B';
+    b.secc_active = true;
+    b.relay_closed_mask = CBPLC_RELAY_GUN;
+    b.session_state = "Daydreaming";
+    settle(&l, &b, &n);
+    CHECK(cbctl_led_preset(&l, n) == CBCTL_LED_CHARGING); /* proxy rule: contactor + session */
+}
+
 /* The names must match the vocabulary the rest of the codebase already sends, or the value
  * needs a translation table that nobody maintains. */
 TEST(the_names_match_the_existing_led_command_vocabulary)
@@ -183,6 +307,11 @@ int main(void)
     RUN(a_stale_observation_never_claims_charging);
     RUN(the_safety_chain_outranks_a_live_charge);
     RUN(a_quarantined_link_is_faulted_not_available);
+    RUN(raw_safety_ranks_like_the_strip);
+    RUN(a_drifted_expander_is_faulted_not_available);
+    RUN(a_firmware_downgrade_retires_the_raw_snapshot);
+    RUN(the_boards_charge_machine_names_the_preset);
+    RUN(an_unknown_charge_state_degrades_to_the_proxies);
     RUN(the_names_match_the_existing_led_command_vocabulary);
     if (g_fail) {
         printf("FAIL led (%d)\n", g_fail);

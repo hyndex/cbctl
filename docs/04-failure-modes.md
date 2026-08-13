@@ -119,11 +119,25 @@ eventually open for no reason but scheduling.
 `cbctl_led_preset()` derives the connector's presentation state from the same observation
 everything else reads. The OCPP status, the session state, the charge state and the LED preset
 are four parallel state machines; updated in four places they drift, and a driver ends up in
-front of a light that disagrees with the charger. One derivation, one order, no drift.
+front of a light that disagrees with the charger. One derivation keeps every controller-side
+surface — HMI, logs, the OCPP mapping — on one answer.
 
-Order, most-dangerous-first: `emergency` (safety chain) → `faulted` (link lost) →
-`booting` (not identified) → `faulted` (**stale observation**) → `finishing` (stop raised) →
-`charging` (contactor closed AND session open) → `preparing` (plugged) → `available`.
+**The connector's own light is the board's.** Firmware from 2026-08-14 renders a WS2812B strip
+on the cabinet from the board's local state (cbplc `main.cpp led_preset()`), because a light
+that needs a live controller to change colour fails dark exactly when it matters. This
+function is therefore the controller-side twin of the one driving the pixels, and the two rank
+the same evidence the same way — the raw safety chain (`safety_in`/`safety_bus`), expander
+drift, and the board's `session=` charge machine. Any divergence between them is a bug, not a
+freedom. The one honest difference is staleness, which only the controller can suffer.
+
+Order, most-dangerous-first: `emergency` (**the e-stop bit** of the raw chain; an unreadable
+safety bus or a protection trip is `faulted`, and legacy firmware that publishes only the
+classified flag keeps `emergency` because the e-stop cannot be told apart there) → `faulted`
+(link lost, or expander drift) → `booting` (not identified) → `faulted` (**stale
+observation**) → `faulted` (the board's machine says `Fault`) → `finishing` (stop raised, or
+the board's machine says `Stopping` — how a vehicle-initiated stop arrives) → `charging` (the
+board's machine says `Energised`; for firmware without `session=`, contactor closed AND
+session open) → `preparing` (plugged) → `available`.
 
 Two rules worth their own line:
 
@@ -132,13 +146,14 @@ Two rules worth their own line:
   battery. Showing `faulted` when the charger is secretly fine costs an unnecessary unplug.
   That asymmetry decides the rule, and the threshold is the same one that sets `DEGRADED`, so
   the light and the link state cannot disagree about whether our picture is trustworthy.
-- **A closed contactor alone is not `charging`.** Without an open session that is precharge or
-  a fault, and the driver is not getting energy yet.
+- **A closed contactor alone is not `charging`.** The gun contactor deliberately closes for
+  CableCheck — isolation testing needs it — tens of seconds before energy flows, which is why
+  the board's own `session=` machine outranks the contactor proxy whenever it is published.
 
-cbctl does not drive pixels: the cbplc wire protocol has **no LED message**. The names match
-the vocabulary this codebase already sends (`booting`/`available`/`preparing`/`charging`/
-`finishing`/`faulted`/`emergency`) so the value drops into an existing LED command with no
-translation table to maintain.
+cbctl does not drive pixels: the cbplc wire protocol has **no LED message**, and the cabinet
+strip is lit by the board itself. The names match the vocabulary both firmwares use
+(`booting`/`available`/`preparing`/`charging`/`finishing`/`faulted`/`emergency`) so the value
+drops into any controller-side display with no translation table to maintain.
 
 ## 6. Known limits — verified as far as they can be, and no further
 

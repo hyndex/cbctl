@@ -278,13 +278,25 @@ void cbctl_status_apply(cbctl_link_t *link, const uint8_t *payload, size_t len, 
      * past the payload cap, cbplc deliberately sends a short "status_overflow=N cp=… session=…"
      * line instead of going quiet. It legitimately has no tail key. Counting that as truncation
      * would throw away the one message whose entire purpose is to report the overflow. */
+    bool overflow_reported = false;
     if (u32_field(buf, len, "status_overflow", &v)) {
         link->counters[CBCTL_CTR_STATUS_OVERFLOWS] = v;
+        overflow_reported = true;
     }
     {
         size_t tl = 0u;
         if (field(buf, len, CBCTL_STATUS_TAIL_KEY, &tl) == NULL) {
-            link->counters[CBCTL_CTR_STATUS_TRUNCATED]++;
+            /* The overflow MARKER legitimately has no tail key — it IS short, that is its
+             * message — so it must not count as a truncation: that inflated
+             * CBCTL_CTR_STATUS_TRUNCATED at poll rate for as long as STATUS overflowed,
+             * pointing the operator at the transport when the payload size was the story.
+             * The presence of status_overflow= alone cannot make that call, because a
+             * healthy full line may carry the key too (the loopback's does): only
+             * key-present AND tail-missing is the marker. Nothing else on it is applied,
+             * by the same completeness rule as everything below. */
+            if (!overflow_reported) {
+                link->counters[CBCTL_CTR_STATUS_TRUNCATED]++;
+            }
             return;
         }
     }
@@ -403,6 +415,44 @@ void cbctl_status_apply(cbctl_link_t *link, const uint8_t *payload, size_t len, 
     }
     if (u32_field(buf, len, "safety", &v)) {
         now_flags[CBCTL_FLAG_SAFETY_ASSERTED] = (v != 0u);
+        /* A legacy line PROVES the firmware is the classified generation NOW. Without
+         * this, safety_raw_valid set by an earlier raw-generation boot stayed sticky
+         * across an OTA rollback on a live link (same MAC, reset absorbed, no reopen),
+         * and the LED ranking kept consulting a frozen raw mask: a legacy-published
+         * e-stop (safety=1) then rendered AVAILABLE instead of EMERGENCY, because the
+         * stale raw snapshot said the chain was clear and swallowed the ranking. */
+        link->safety_raw_valid = 0u;
+    }
+    /* The board's OWN charge machine, by name. The LED ranking needs it because the
+     * proxies it used instead were measurably wrong on every session: the gun contactor
+     * closes for CableCheck tens of seconds before energy flows (so contactor+session
+     * claimed CHARGING through PreCharge), and a vehicle-initiated stop never touches the
+     * controller's stop latch (so FINISHING was simply missed). An unrecognised name maps
+     * to UNKNOWN rather than being guessed at — a future firmware state must degrade to
+     * the proxy ranking, not impersonate an old one. */
+    {
+        static const struct { const char *name; uint8_t value; } kChg[] = {
+            {"Idle",        (uint8_t)CBCTL_BOARD_CHG_IDLE},
+            {"AwaitAuth",   (uint8_t)CBCTL_BOARD_CHG_AWAIT_AUTH},
+            {"Linking",     (uint8_t)CBCTL_BOARD_CHG_LINKING},
+            {"Negotiating", (uint8_t)CBCTL_BOARD_CHG_NEGOTIATING},
+            {"Energised",   (uint8_t)CBCTL_BOARD_CHG_ENERGISED},
+            {"Stopping",    (uint8_t)CBCTL_BOARD_CHG_STOPPING},
+            {"Fault",       (uint8_t)CBCTL_BOARD_CHG_FAULT},
+        };
+        size_t sl = 0u;
+        const char *sp = field(buf, len, "session", &sl);
+        if (sp != NULL) {
+            size_t i;
+            link->board_chg = (uint8_t)CBCTL_BOARD_CHG_UNKNOWN;
+            for (i = 0u; i < sizeof kChg / sizeof kChg[0]; i++) {
+                if (strlen(kChg[i].name) == sl &&
+                    memcmp(kChg[i].name, sp, sl) == 0) {
+                    link->board_chg = kChg[i].value;
+                    break;
+                }
+            }
+        }
     }
     /* Raw-publishing firmware (2026-08-14 onward) drops `safety=` and sends the
      * pins verbatim. The classified flag is DERIVED here so every downstream

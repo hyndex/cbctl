@@ -20,22 +20,14 @@
  *   itself. That is what makes a crashed controller safe rather than merely
  *   detectable, and it is why hold_ms is a REQUIRED part of a close, not an option.
  *
- * HOW THE TWO ANSWERS DIFFER, AND WHY THERE ARE TWO
- *   A safety input has to drive two different decisions with different costs:
- *
- *     de-energise NOW      One raw sample is enough. Waiting to be sure before
- *                          opening a contactor is not a trade worth making.
- *
- *     latch the session    Requires a DEBOUNCED assertion — the input held for
- *                          kDebounceMs. A single glitch that then proves clean must
- *                          not end a charge that has to be restarted by hand.
- *                          Measured: a transient on this bench board latched the
- *                          session in Fault while the chain read clear, and only an
- *                          unplug could clear it.
- *
- *   So cbplc_safety_raw_asserted() gates energy and cbplc_safety_faulted() is the
- *   verdict. Both directions are needed; collapsing them into one loses either the
- *   fail-fast open or the tolerance of a glitch.
+ * WHERE THE POLICY WENT (2026-08-14)
+ *   Every fault POLICY that used to be documented here — the raw/debounced
+ *   split, cause classification, session latching, proven-clear tracking and
+ *   the close refusals built on them — lives in the controller now
+ *   (cbcontroller-v2 src/safety/supervisor.cpp), which reads safety_in /
+ *   safety_bus from STATUS and commands every fault response through the
+ *   normal relay path. The dead-man lease stays: it is a liveness contract,
+ *   not fault handling.
  *
  * WHY EVERY INPUT STARTS ASSERTED
  *   Carried over from plc_firmware's FailSafeInputDebouncer: sampled AND published
@@ -64,11 +56,35 @@ extern "C" {
 #endif
 
 /* Bit positions, and they are a contract: the controller sends these masks on the
- * wire, so renumbering them silently changes which contactor moves. */
-#define CBPLC_RELAY_GUN   0x01u /* DC gun contactor — the dangerous one */
-#define CBPLC_RELAY_AUX   0x02u
-#define CBPLC_RELAY_POWER 0x04u /* upstream/module power path */
+ * wire, so renumbering them silently changes which contactor moves.
+ *
+ * WHAT EACH BIT PHYSICALLY IS. Spelled out because two gates in this file disagreed
+ * about it and neither said which relay it meant:
+ *   relay 1  this gun's DC contactor
+ *   relay 2  the tie that BORROWS the other gun's power modules onto this gun's DC bus
+ *   relay 3  the AC contactors feeding the module bank */
+#define CBPLC_RELAY_GUN   0x01u /* relay 1 — DC gun contactor, the dangerous one */
+#define CBPLC_RELAY_AUX   0x02u /* relay 2 — module-borrow tie from the other gun */
+#define CBPLC_RELAY_POWER 0x04u /* relay 3 — AC feed to the modules, shared plant */
 #define CBPLC_RELAY_ALL   0x07u
+
+/* THE ENERGY-BEARING SET, DEFINED ONCE.
+ *
+ * Relay 1 and relay 2 both put DC on this gun's bus — 1 is the contactor at the
+ * connector, 2 ties the neighbouring gun's live modules onto the same bus. Relay 3 is
+ * upstream AC into a module bank that several connectors share, which is why the local
+ * open paths deliberately leave it alone: dropping it because THIS vehicle unplugged
+ * would take the neighbouring gun's charge down with it.
+ *
+ * There used to be two answers to "which relays are energy-bearing". main.cpp's open
+ * paths used GUN|AUX; cbplc_relay_may_close() applied the controller contract to
+ * GUN|POWER. The gap was relay 2: a close of the module-borrow tie ALONE required
+ * neither a live controller, nor an authorisation, nor the vehicle negotiation's
+ * consent — only a clear chain and an undrifted expander. So a stale RELAY request
+ * could tie the other gun's live modules onto an unsupervised bus. Two gates
+ * disagreeing about which relay carries energy is exactly how something closes that
+ * should have stayed open, so there is now one definition and both consult it. */
+#define CBPLC_RELAY_ENERGY (CBPLC_RELAY_GUN | CBPLC_RELAY_AUX)
 
 /* Dead-man ceiling. A LONGER value is strictly less safe, so this is the longest
  * we accept and a request beyond it is clamped AND reported — never silently
@@ -76,15 +92,6 @@ extern "C" {
  * Sized to outlast a supervising controller's restart, matching the 30 s lease
  * plc_firmware settled on for exactly that reason. */
 #define CBPLC_RELAY_HOLD_MAX_MS 30000u
-
-/* How long an input must hold a state before that state is believed.
- *
- * 120 ms is long enough to ride out the contact bounce and the brownout-induced I2C
- * glitches this carrier produces (measured in the field at 100-1000 ms on
- * power-fragile boards, so a longer window would swallow real faults), and short
- * enough that a genuine fault latches well inside a human reaction time. The relays
- * do not wait for it — see raw_asserted above. */
-#define CBPLC_SAFETY_DEBOUNCE_MS 120u
 
 /* The external safety chain. Every one is active-low in hardware and normalised to
  * "true = asserted = bad" here, so no reader has to remember the polarity. */
@@ -96,62 +103,31 @@ typedef struct {
     bool insulation;
 } cbplc_safety_inputs_t;
 
-/* One debouncer per input. Both fields start true: fail-safe by construction. */
-typedef struct {
-    bool sampled_active;
-    bool active;
-    uint32_t last_change_ms;
-} cbplc_safety_input_t;
-
 #define CBPLC_SAFETY_INPUT_COUNT 5
 
+/* RAW STATE ONLY — see WHERE THE POLICY WENT above. Bit i of raw_mask follows
+ * the order safety.c's _Static_assert documents: estop, earth, insulation,
+ * fuse_spd, ac_voltage. bus_unreadable means the last sample FAILED and
+ * raw_mask holds the fail-safe all-asserted fill — a dead I2C bus must never
+ * read as a healthy chain, and the controller names that cause "bus". */
 typedef struct {
-    cbplc_safety_input_t in[CBPLC_SAFETY_INPUT_COUNT];
-    /* Set once a fault has ever been confirmed this boot. Diagnostics only — it must
-     * never gate anything, because "was faulted" is not "is faulted". */
-    bool ever_faulted;
-    uint32_t confirmations;
-    /* Bit per input, set the first time that input is believed inactive. */
-    uint8_t proven_mask;
+    uint8_t raw_mask;
+    bool bus_unreadable;
 } cbplc_safety_t;
 
-/* Start every input ASSERTED. A zeroed struct would start them clear, which is the
- * one starting belief a safety chain must not have. */
+/* Start with the fail-safe fill: all inputs asserted, bus unproven. */
 void cbplc_safety_init(cbplc_safety_t *s, uint32_t now_ms);
 
-/* Feed one sample of the chain. `in` NULL means the read FAILED, which is treated as
- * every input asserted with no evidence — a missing sample is not a clear one, and a
- * dead I2C bus must not read as a healthy safety chain.
- *
- * Returns true while any input is CONFIRMED (debounced) asserted. */
+/* Feed one sample. `in` NULL means the read FAILED: raw_mask takes the
+ * all-asserted fill and bus_unreadable is set until a clean sample lands.
+ * Returns true when any bit is asserted, for callers that only branch. */
 bool cbplc_safety_update(cbplc_safety_t *s, const cbplc_safety_inputs_t *in,
                          uint32_t now_ms);
 
-/* The VERDICT: some input has held asserted long enough to be believed. This is what
- * latches a session fault. */
-bool cbplc_safety_faulted(const cbplc_safety_t *s);
+/* The pins as last sampled, bit i per the order above. */
+uint8_t cbplc_safety_raw_mask(const cbplc_safety_t *s);
 
-/* Has the chain ever been PROVEN clear?
- *
- * Every input starts asserted (fail-safe), so "not clear" at boot means "not yet
- * proven", which is a completely different thing from "confirmed faulted". Without
- * this distinction a charger that boots with a vehicle already plugged in latches a
- * safety fault before it has taken its first stable sample — measured on the bench,
- * and it needed an unplug to clear.
- *
- * True once every input has been believed INACTIVE at least once since init. Energy
- * still requires the chain to be clear NOW; this only says a fault is a real
- * transition rather than a startup condition. */
-bool cbplc_safety_proven(const cbplc_safety_t *s);
-
-/* The RAW answer: some input is asserted in the most recent sample, believed or not.
- * This is what gates energy, because opening a contactor is cheap and being wrong
- * about it in the other direction is not. */
-bool cbplc_safety_raw_asserted(const cbplc_safety_t *s);
-
-/* A short stable token naming the FIRST asserted input, for the wire. Callers get
- * "why", not just "no" — a refusal without a cause costs a site visit. */
-const char *cbplc_safety_reason(const cbplc_safety_t *s);
+bool cbplc_safety_bus_unreadable(const cbplc_safety_t *s);
 
 /* ---------------------------------------------------------------------------
  * Relay state
@@ -166,6 +142,14 @@ typedef struct {
     bool drifted;
     uint32_t drift_events;
     uint32_t denied_closes;
+    /* The readback that disagreed, kept for diagnosis only.
+     *
+     * The collapse below zeroes `verified_open`, which is correct — "proven open" must
+     * mean "a read we currently trust said so" — but it also destroyed the only record of
+     * WHICH pins disagreed, so a drifted board could report that it was drifted and never
+     * what it saw. A field investigation spent days unable to tell one stuck relay pin from
+     * three. This field is written on the mismatch and read by nothing except STATUS. */
+    uint8_t drift_readback;
 } cbplc_relay_t;
 
 /* Everything that must be true before a close is permitted. Assembled by the
@@ -174,7 +158,6 @@ typedef struct {
     bool vehicle_present;   /* from the CP decoder — untrusted CP answers false */
     bool authorized;        /* controller AUTHORIZE is live and granted */
     bool controller_alive;  /* heartbeat within its window */
-    bool safety_clear;      /* no latched fault */
     bool hlc_permits;       /* the V2G layer has not asked for a stop */
 } cbplc_close_preconditions_t;
 
@@ -183,7 +166,11 @@ typedef struct {
  * The GUN relay is held to a stricter rule than the others: closing it onto a
  * connector with no vehicle is the one mistake with no safe outcome, so
  * vehicle_present is checked UNCONDITIONALLY for it, in every ownership mode.
- * plc_firmware had a bug where a mode flag skipped that check. */
+ * plc_firmware had a bug where a mode flag skipped that check.
+ *
+ * Everything ELSE required here applies to EVERY relay this board drives — see
+ * CBPLC_RELAY_ENERGY for why the old GUN|POWER carve-out was a hole rather than a
+ * concession. */
 cbplc_err_t cbplc_relay_may_close(const cbplc_relay_t *r,
                                   uint8_t mask,
                                   const cbplc_close_preconditions_t *pre);

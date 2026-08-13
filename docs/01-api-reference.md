@@ -590,9 +590,11 @@ cbctl_led_t   cbctl_led_preset(const cbctl_link_t *link, uint32_t now_ms);
 const char   *cbctl_led_name(cbctl_led_t p);
 ```
 
-cbctl does not drive pixels; it tells you what state the gun is in so your display layer can
-render it. `cbctl_led_name()` is a pure lookup and the only public call not parameterised by a
-link.
+cbctl does not drive pixels; it tells you what state the gun is in so controller-side surfaces
+(HMI, dashboards, logs) can render it. The connector's own cabinet strip is rendered by the
+board itself (firmware 2026-08-14 onward) from the same evidence and the same ranking — see
+§5.2 of the failure-modes chapter for the parity contract. `cbctl_led_name()` is a pure lookup
+and the only public call not parameterised by a link.
 
 ## 11. SLAC
 

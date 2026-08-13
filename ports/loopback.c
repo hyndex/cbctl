@@ -155,9 +155,17 @@ static void plc_on_message(void *user, const cbplc_msg_t *msg, cbplc_err_t statu
         } else {
             snprintf(safety_kv, sizeof safety_kv, "safety=%d", lb->safety_asserted ? 1 : 0);
         }
+        /* session= is optional the same way safety_in is: NULL renders nothing, so a test
+         * that never sets it exercises the legacy line and the parser's UNKNOWN fallback. */
+        char session_kv[32];
+        if (lb->session_state != NULL) {
+            snprintf(session_kv, sizeof session_kv, "session=%s ", lb->session_state);
+        } else {
+            session_kv[0] = '\0';
+        }
         char body[448];
         const int n = snprintf(body, sizeof body,
-            "cp=%c slac_matched=%d secc_active=%d secc_streams=%lu last_stop=1 stop=%d "
+            "cp=%c %sslac_matched=%d secc_active=%d secc_streams=%lu last_stop=1 stop=%d "
             "evcc_len=%u evcc=%s "
             "ev_mac=%02X%02X%02X%02X%02X%02X ev_mac_ok=%d up_ms=%lu "
             "relay_safety_opens=%lu relay_lease_opens=%lu gun_open_timeouts=%lu "
@@ -167,7 +175,7 @@ static void plc_on_message(void *user, const cbplc_msg_t *msg, cbplc_err_t statu
              * reads as truncated — which is the truncation guard working, and exactly what
              * caught this when the firmware's STATUS grew. Keep it last. */
             "status_overflow=0 b1_dwell=1500 " CBCTL_STATUS_TAIL_KEY "=0",
-            lb->cp ? lb->cp : 'A', lb->slac_matched ? 1 : 0, lb->secc_active ? 1 : 0,
+            lb->cp ? lb->cp : 'A', session_kv, lb->slac_matched ? 1 : 0, lb->secc_active ? 1 : 0,
             (unsigned long)lb->secc_streams, lb->stop_latched ? 1 : 0,
             (unsigned)lb->evcc_id_len, evcc_hex,
             lb->ev_mac[0], lb->ev_mac[1], lb->ev_mac[2], lb->ev_mac[3], lb->ev_mac[4],

@@ -64,6 +64,10 @@ typedef struct {
     bool     safety_bus_unreadable;
     bool     relay_drifted;
     uint8_t  relay_drift_readback;
+    /* The board's charge machine as session= names it ("Idle".."Fault", or anything —
+     * unrecognised names are the UNKNOWN-degrades-to-proxy test). NULL models legacy
+     * firmware that never publishes the key, which is why NULL is the default. */
+    const char *session_state;
     uint8_t  relay_closed_mask;
     uint32_t dc_answers;    /* mirrors cbplc's dc_ans */
     bool     ev_demand_idle;/* set to stop answering: models a vehicle that has gone quiet */

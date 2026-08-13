@@ -3,154 +3,67 @@
 #include <string.h>
 
 
-/* Input order is the REPORTING order too: most urgent first, so the reason string
- * names the worst active cause rather than whichever bit happened to be lowest. */
-enum {
-    IDX_ESTOP = 0,
-    IDX_EARTH,
-    IDX_INSULATION,
-    IDX_FUSE_SPD,
-    IDX_AC_VOLTAGE,
-};
-
-static const char *const kInputNames[CBPLC_SAFETY_INPUT_COUNT] = {
-    "estop", "earth", "insulation", "fuse_spd", "ac_voltage",
-};
-
-/* Wrap-safe: the 32-bit ms clock wraps every 49.7 days and unsigned subtraction is
- * correct across it. A signed comparison would make every input decide it had been
- * stable forever at the wrap. */
-static bool held_for(uint32_t now_ms, uint32_t since_ms, uint32_t ms)
-{
-    return (uint32_t)(now_ms - since_ms) >= ms;
-}
+/* Bit order of raw_mask, which is also the controller-side reporting order:
+ * most urgent first. The controller (cbcontroller-v2 supervisor) owns the
+ * names, the debounce and every policy built on these bits — this file only
+ * promises the ORDER stays stable, because the wire carries positions. */
+_Static_assert(CBPLC_SAFETY_INPUT_COUNT == 5,
+               "adding a safety input means updating the mask fill in "
+               "cbplc_safety_update(), cbplc_safety_inputs_t, and the "
+               "controller-side classifier that names each bit");
 
 void cbplc_safety_init(cbplc_safety_t *s, uint32_t now_ms)
 {
+    (void)now_ms;
     if (s == NULL) {
         return;
     }
-    memset(s, 0, sizeof *s);
-    for (size_t i = 0; i < CBPLC_SAFETY_INPUT_COUNT; ++i) {
-        /* ASSERTED, not clear. "Nothing sampled yet" must never permit energy. */
-        s->in[i].sampled_active = true;
-        s->in[i].active = true;
-        s->in[i].last_change_ms = now_ms;
-    }
-}
-
-/* One debouncer step. Symmetric in time and asymmetric in consequence: the caller
- * reads `sampled_active` to de-energise immediately and `active` to pass judgement. */
-static void observe(cbplc_safety_input_t *d, bool sampled, uint32_t now_ms)
-{
-    if (sampled != d->sampled_active) {
-        d->sampled_active = sampled;
-        d->last_change_ms = now_ms;
-    }
-    if (d->active != d->sampled_active &&
-        held_for(now_ms, d->last_change_ms, CBPLC_SAFETY_DEBOUNCE_MS)) {
-        d->active = d->sampled_active;
-    }
+    /* ASSERTED, not clear. "Nothing sampled yet" must never permit energy —
+     * the controller, which owns all fault policy now, sees the fail-safe fill
+     * until the first clean sample replaces it. */
+    s->raw_mask = (uint8_t)((1u << CBPLC_SAFETY_INPUT_COUNT) - 1u);
+    s->bus_unreadable = true;
 }
 
 bool cbplc_safety_update(cbplc_safety_t *s, const cbplc_safety_inputs_t *in,
                          uint32_t now_ms)
 {
+    (void)now_ms;
     if (s == NULL) {
         return true;
     }
     if (in == NULL) {
-        /* The read FAILED, so the chain's state is unknown. Unknown asserts
-         * immediately and WITHOUT the debounce window, and it also destroys any
-         * standing inactive evidence: recovery has to earn a fresh full debounce.
-         * A dead I2C bus must not read as a healthy safety chain. */
-        for (size_t i = 0; i < CBPLC_SAFETY_INPUT_COUNT; ++i) {
-            if (!s->in[i].active || !s->in[i].sampled_active) {
-                s->in[i].last_change_ms = now_ms;
-            }
-            s->in[i].sampled_active = true;
-            s->in[i].active = true;
-        }
-        s->ever_faulted = true;
-        /* The proof is voided as well. Evidence gathered before the bus died says
-         * nothing about the chain now, and inheriting it would let a fault latch on a
-         * chain that has not been re-verified. */
-        s->proven_mask = 0u;
+        /* The read FAILED. Publish the fail-safe fill and say so: a dead I2C
+         * bus must never read as a healthy chain, and naming it lets the
+         * controller report "bus" instead of blaming the first input. */
+        s->raw_mask = (uint8_t)((1u << CBPLC_SAFETY_INPUT_COUNT) - 1u);
+        s->bus_unreadable = true;
         return true;
     }
-
-    const bool sampled[CBPLC_SAFETY_INPUT_COUNT] = {
-        in->emergency_stop, in->earth_fault, in->insulation,
-        in->fuse_or_spd, in->ac_voltage,
-    };
-    bool confirmed = false;
-    for (size_t i = 0; i < CBPLC_SAFETY_INPUT_COUNT; ++i) {
-        observe(&s->in[i], sampled[i], now_ms);
-        if (s->in[i].active) {
-            confirmed = true;
-        } else {
-            /* Believed inactive: this input has now been proven at least once. */
-            s->proven_mask |= (uint8_t)(1u << i);
-        }
-    }
-    if (confirmed) {
-        if (!s->ever_faulted) {
-            s->ever_faulted = true;
-        }
-        s->confirmations++;
-    }
-    return confirmed;
+    /* Bit order is the reporting order the controller's classifier mirrors:
+     * estop, earth, insulation, fuse_spd, ac_voltage. */
+    uint8_t m = 0u;
+    if (in->emergency_stop) { m |= 1u << 0; }
+    if (in->earth_fault)    { m |= 1u << 1; }
+    if (in->insulation)     { m |= 1u << 2; }
+    if (in->fuse_or_spd)    { m |= 1u << 3; }
+    if (in->ac_voltage)     { m |= 1u << 4; }
+    s->raw_mask = m;
+    s->bus_unreadable = false;
+    return m != 0u;
 }
 
-bool cbplc_safety_faulted(const cbplc_safety_t *s)
+uint8_t cbplc_safety_raw_mask(const cbplc_safety_t *s)
 {
     if (s == NULL) {
-        return true;
+        return (uint8_t)((1u << CBPLC_SAFETY_INPUT_COUNT) - 1u);
     }
-    for (size_t i = 0; i < CBPLC_SAFETY_INPUT_COUNT; ++i) {
-        if (s->in[i].active) {
-            return true;
-        }
-    }
-    return false;
+    return s->raw_mask;
 }
 
-bool cbplc_safety_proven(const cbplc_safety_t *s)
+bool cbplc_safety_bus_unreadable(const cbplc_safety_t *s)
 {
-    if (s == NULL) {
-        return false;
-    }
-    const uint8_t all = (uint8_t)((1u << CBPLC_SAFETY_INPUT_COUNT) - 1u);
-    return (s->proven_mask & all) == all;
-}
-
-bool cbplc_safety_raw_asserted(const cbplc_safety_t *s)
-{
-    if (s == NULL) {
-        return true;
-    }
-    for (size_t i = 0; i < CBPLC_SAFETY_INPUT_COUNT; ++i) {
-        if (s->in[i].sampled_active) {
-            return true;
-        }
-    }
-    return false;
-}
-
-const char *cbplc_safety_reason(const cbplc_safety_t *s)
-{
-    if (s == NULL) {
-        return "no_sample";
-    }
-    /* Reports the CONFIRMED cause, matching cbplc_safety_faulted(). A raw-only
-     * assertion is deliberately not named here: it has not been believed yet, and
-     * naming it would put unconfirmed causes in operator-visible logs. */
-    for (size_t i = 0; i < CBPLC_SAFETY_INPUT_COUNT; ++i) {
-        if (s->in[i].active) {
-            return kInputNames[i];
-        }
-    }
-    return "";
+    return s == NULL || s->bus_unreadable;
 }
 
 cbplc_err_t cbplc_relay_may_close(const cbplc_relay_t *r,
@@ -160,28 +73,47 @@ cbplc_err_t cbplc_relay_may_close(const cbplc_relay_t *r,
     if (r == NULL || pre == NULL || mask == 0u || (mask & ~CBPLC_RELAY_ALL) != 0u) {
         return CBPLC_E_BAD_ARGUMENT;
     }
-    /* A drifted expander means its state is UNKNOWN. Refuse every close until a
-     * verified write proves otherwise; guessing is what makes drift dangerous. */
-    if (r->drifted) {
-        return CBPLC_E_NOT_READY;
-    }
-    if (!pre->safety_clear) {
-        return CBPLC_E_NOT_READY;
-    }
+    /* No fault terms here, by decision (2026-08-14): the safety chain and the
+     * drift latch are FAULTS, and all fault policy — including whether either
+     * refuses a close — belongs to the controller. What remains below is the
+     * session/interlock contract, which is not fault handling: a vehicle on CP
+     * before the gun contactor, a live controller, and a driver's
+     * authorisation. The dead-man lease bounds a dead controller. */
     /* THE unconditional rule. Closing the gun contactor onto a connector with no
      * vehicle is the one mistake with no safe outcome, so this is checked in every
      * mode with no exception path. plc_firmware had a mode flag that skipped it. */
     if ((mask & CBPLC_RELAY_GUN) != 0u && !pre->vehicle_present) {
         return CBPLC_E_NOT_READY;
     }
-    /* Energy-bearing relays additionally need the full controller contract. All
-     * three are required together: a live heartbeat proves the controller exists,
-     * authorization proves it consents, and hlc_permits proves the vehicle
-     * negotiation has not asked to stop. */
-    if ((mask & (CBPLC_RELAY_GUN | CBPLC_RELAY_POWER)) != 0u) {
-        if (!pre->controller_alive || !pre->authorized || !pre->hlc_permits) {
-            return CBPLC_E_NOT_READY;
-        }
+    /* THE CONTROLLER CONTRACT, ON EVERY RELAY — with authorisation scoped to the one
+     * relay a driver is involved in. A live heartbeat proves the controller exists and
+     * hlc_permits proves no stop is in force; both are required for every close,
+     * because there is no relay on this board whose close is none of the controller's
+     * business.
+     *
+     * This clause used to read `(mask & (GUN|POWER)) != 0`, which left relay 2 — the tie
+     * that borrows the OTHER gun's live power modules onto this gun's DC bus — closable
+     * with a dead controller, no authorisation and a stop in force. Meanwhile main.cpp's
+     * open paths treated relay 2 as energy-bearing and dropped it on an unplug. One gate
+     * said relay 2 carries energy, the other said it does not, and the disagreement was
+     * only ever going to be resolved in the permissive direction, at a connector. */
+    if (!pre->controller_alive || !pre->hlc_permits) {
+        return CBPLC_E_NOT_READY;
+    }
+    /* AUTHORISATION IS A STATEMENT ABOUT A DRIVER AT THIS GUN, so it gates the gun
+     * contactor and nothing else. Requiring it on every relay closed the previous hole
+     * by opening a new one: relay 2's close arrives on the DONOR's board, and a donor
+     * is BY CONSTRUCTION an idle, vehicle-free, unauthorised connector — its bank is
+     * being lent precisely because nobody is using it. With the blanket clause the
+     * cross-tie close was NACKed on every attempt, the controller's borrow machine
+     * timed out every attach, and cross-PLC power sharing could not complete at all —
+     * silently, at one journal line per 18 s retry cycle. Relay 3 (shared AC plant) is
+     * likewise a plant operation with no driver: the controller closes it on physical
+     * presence, BEFORE any authorisation decision exists. The lend and the plant stay
+     * supervised through the terms above plus the dead-man lease; what they do not
+     * need is a driver's consent on a connector that has no driver. */
+    if ((mask & CBPLC_RELAY_GUN) != 0u && !pre->authorized) {
+        return CBPLC_E_NOT_READY;
     }
     return CBPLC_E_OK;
 }
@@ -214,6 +146,7 @@ bool cbplc_relay_note_write(cbplc_relay_t *r,
          * bus just delays the safe outcome. */
         r->drifted = true;
         r->drift_events++;
+        r->drift_readback = readback;
         r->closed = 0u;
         r->verified_open = 0u;
         memset(r->deadline_ms, 0, sizeof r->deadline_ms);

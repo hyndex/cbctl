@@ -631,6 +631,11 @@ typedef struct {
      * the board's; policy is the controller's. */
     uint8_t  relay_drifted;           /* bool */
     uint8_t  relay_drift_readback;
+    /* The board's OWN charge machine, verbatim from session=. UNKNOWN until a
+     * recognised name lands, and on firmware that never publishes one — the LED
+     * ranking falls back to its older proxies then, so legacy boards keep the
+     * behaviour they shipped with. */
+    uint8_t  board_chg;               /* cbctl_board_chg_t */
 
     /* Raw STATUS observer. NULL by default; set it and every status payload the board sends is
      * handed over verbatim before any parsing.
@@ -891,20 +896,46 @@ bool cbctl_next_event(cbctl_link_t *link, cbctl_event_t *out);
 
 /* ---- driver-facing presentation (LED / display) ----------------------------------------- */
 
+/* The board's own charge machine, verbatim from STATUS `session=`. Parsed rather than
+ * re-derived because the proxies this library used to rank the LED from (contactor bit +
+ * session flag + its own stop latch) genuinely disagree with the machine: the gun contactor
+ * closes for CableCheck long before energy flows, and a vehicle-initiated stop never passes
+ * through the controller's stop latch at all. UNKNOWN covers firmware that publishes no
+ * recognisable name — every consumer must keep working without it. */
+typedef enum {
+    CBCTL_BOARD_CHG_UNKNOWN = 0, /* not published, or a name this build does not know */
+    CBCTL_BOARD_CHG_IDLE,
+    CBCTL_BOARD_CHG_AWAIT_AUTH,
+    CBCTL_BOARD_CHG_LINKING,
+    CBCTL_BOARD_CHG_NEGOTIATING,
+    CBCTL_BOARD_CHG_ENERGISED,
+    CBCTL_BOARD_CHG_STOPPING,
+    CBCTL_BOARD_CHG_FAULT
+} cbctl_board_chg_t;
+
 /* What the connector should be SHOWING, derived from the same snapshot everything else uses.
  *
  * WHY THIS LIVES IN THE LIBRARY. This project has a recorded failure class of exactly one
  * shape: the OCPP state, the session state, the charge state and the LED preset are four
  * parallel state machines, they are updated in four places, and they drift. A driver then
  * stands in front of a connector whose light disagrees with what the charger is doing.
- * Deriving the preset HERE, from one observation, in one function, makes that drift
- * impossible rather than merely discouraged.
+ * Deriving the preset HERE, from one observation, in one function, keeps every
+ * CONTROLLER-SIDE surface (HMI, logs, OCPP mapping) on one answer.
+ *
+ * THE CABINET STRIP IS NOT ONE OF THOSE SURFACES ANY MORE. Firmware from 2026-08-14 renders
+ * its own WS2812B strip from the board's local state (cbplc src/app/main.cpp led_preset()),
+ * because a light that needs a live controller to change colour fails dark exactly when it
+ * matters. The two derivations therefore RANK THE SAME EVIDENCE THE SAME WAY — the raw
+ * safety chain, expander drift, and the session= charge machine — and every divergence
+ * between them is a bug in this file or that one, not a design freedom. The remaining
+ * honest difference is staleness: the board is never stale to itself, while this function
+ * refuses to claim CHARGING from a quiet link.
  *
  * The names match the vocabulary the rest of this codebase already uses, so the value drops
  * straight into an existing LED command without a translation table nobody maintains.
  *
  * cbctl does NOT drive pixels: the cbplc wire protocol has no LED message. This tells you what
- * to show; your display, LED driver or existing LED command shows it. */
+ * to show on controller-side displays; the connector's own light is the board's. */
 typedef enum {
     CBCTL_LED_BOOTING = 0, /* not identified yet — we do not know what this connector is    */
     CBCTL_LED_AVAILABLE,   /* healthy, nothing plugged                                      */
