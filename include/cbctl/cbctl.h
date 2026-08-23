@@ -609,6 +609,16 @@ typedef struct {
     uint32_t relay_refusal_streak; /* consecutive refusals; retry-at-once is capped by this */
     uint32_t auth_danger_preempts; /* AUTHORIZE re-asserts that jumped the feed to save a lease */
     bool     relay_ack_pending;
+    /* A RELAY request is on the wire whose delivery is unproven. Distinct from
+     * relay_ack_pending, which is armed only for held CLOSES (lease accounting): this one is
+     * armed for every RELAY frame, opens included, because it exists to answer a different
+     * question — "if this exchange is lost, does the intent still need the wire?" An OPEN
+     * used to have no representative here at all: relay_dirty was cleared at enqueue, no
+     * renewal re-carries an open, so one swallowed frame abandoned the open forever while
+     * the board held its contactor to the end of the lease. Field incident evse-v1dqa
+     * 2026-08-17: an emergency cross-tie open lost in a USB disturbance was never re-sent,
+     * and the release confirm convicted a healthy contactor as welded (EVSE-PWR-0707). */
+    bool     relay_inflight;
     uint32_t relay_safety_base;   /* safety-open count when the close intent was established */
     bool     relay_base_valid;
     uint32_t ev_target_mv, ev_target_ma;

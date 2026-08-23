@@ -85,6 +85,8 @@ typedef struct {
     uint32_t secc_streams;
     uint32_t up_ms;
     uint32_t relay_lease_opens, gun_open_timeouts, relay_safety_opens;
+    unsigned relay_seen;         /* RELAY frames that actually reached the board */
+    uint8_t  last_relay_state;   /* payload[1] of the last one — what the wire commanded */
     /* Accept every RELAY close and then immediately "open it again" in the reported counters,
      * exactly as the board's safety layer does when a precondition is unmet. */
     bool     safety_undoes_closes;

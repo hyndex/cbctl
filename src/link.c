@@ -156,6 +156,29 @@ static void on_message(void *user, const cbplc_msg_t *msg, cbplc_err_t status)
         if (link->relay_ack_pending) {
             link->relay_ack_pending = false;
         }
+        /* A LOST RELAY FRAME RE-ARMS THE INTENT. diag and prov already do this ("an intent
+         * is not quietly abandoned"); RELAY was the one intent that could be. For a held
+         * close the renewal cadence would eventually repair the loss, but an OPEN has no
+         * renewal — relay_dirty was cleared at enqueue, so a swallowed open left the board
+         * holding a contactor the controller believed released, until the dead-man lease
+         * expired up to 10 s later. Re-arming dirty re-sends the CURRENT desired state on
+         * the next free slot, which is also correct when the intent changed while the lost
+         * frame was in flight.
+         *
+         * ONLY WHEN THE REQUEST ACTUALLY COMPLETED. Not every non-OK delivery is a loss:
+         * an inbound frame that fails to DECODE is delivered through this same path while
+         * the outstanding request is still live on the wire (session.c keeps pending_id and
+         * goes on retrying; the real ACK arrives later). Re-arming there double-books the
+         * exchange — and on a standing close refusal plus a noisy wire it re-sends the
+         * refused close at the next free slot with the refusal never counted (the corrupt
+         * frame already cleared relay_ack_pending above), which is the ungoverned
+         * refusal-storm the streak governor below exists to prevent. Every genuine
+         * completion zeroes the pending request before delivering, so "the session is no
+         * longer busy" is exactly "this delivery ended the RELAY exchange". */
+        if (link->relay_inflight && !cbplc_busy(&link->session)) {
+            link->relay_inflight = false;
+            link->relay_dirty = true;
+        }
         if (link->op_on_wire && link->op_state == CBCTL_OP_PENDING) {
             link->op_state = CBCTL_OP_LOST;
             link->op_on_wire = false;
@@ -318,6 +341,14 @@ static void on_message(void *user, const cbplc_msg_t *msg, cbplc_err_t status)
                  * visible in link->prov for a caller to inspect. */
                 link->prov_refused++;
             }
+        }
+        /* Stop-and-wait carries one outstanding request, so an ACK arriving while
+         * relay_inflight is set is necessarily the RELAY frame's: delivery is proven and the
+         * loss re-arm above must not fire for it. relay_dirty is deliberately NOT touched —
+         * cbctl_relay_open/close may have re-dirtied the intent while this frame was in
+         * flight, and that newer intent still needs the wire. */
+        if (link->relay_inflight) {
+            link->relay_inflight = false;
         }
         /* A relay ACK is the only proof the lease was actually extended. Re-stamp from it so
          * the renewal clock measures APPLIED renewals, not attempted ones. */
@@ -930,6 +961,7 @@ static bool issue_one(cbctl_link_t *link, cbctl_instant_t now)
         buf[2] = (uint8_t)(link->relay_hold_ms / 100u);
         if (cbplc_request(&link->session, CBPLC_T_RELAY, buf, 3u, now.ms, &id) == CBPLC_E_OK) {
             link->relay_ack_pending = true;
+            link->relay_inflight = true;
             link->relay_dirty = false;
             link->relay_renewals++;
             link->relay_danger_preempts++;
@@ -1104,6 +1136,7 @@ static bool issue_one(cbctl_link_t *link, cbctl_instant_t now)
              * and never applied reset our timer, so a silent board would look renewed while
              * its lease quietly ran out. */
             link->last_relay = now;
+            link->relay_inflight = true;
             link->relay_dirty = false;
             /* Only a CLOSE has a lease, so only a close may report one. Counting an open as a
              * renewal is what let "renewals 50 / acks 49" describe a run whose gun was open
@@ -1368,6 +1401,13 @@ cbctl_status_t cbctl_tick(cbctl_link_t *link, uint32_t now_ms)
                 link->op_state = CBCTL_OP_LOST;
                 link->op_on_wire = false;
                 link->consecutive_losses++;
+            }
+            /* Same attribution for the intent itself: the request the wire just gave up on
+             * was the RELAY frame, and its delivery is unproven. Mirrors the on_message loss
+             * path — this site exists for completions that never reach that callback. */
+            if (was_busy && link->relay_inflight) {
+                link->relay_inflight = false;
+                link->relay_dirty = true;
             }
             if (!issue_one(link, now)) {
                 break; /* nothing due — the normal idle exit */

@@ -796,6 +796,53 @@ TEST(a_lost_relay_renewal_does_not_crash_or_forge_an_ack)
     CHECK(link.relay_acks > acks_before);
 }
 
+/* FIELD INCIDENT evse-v1dqa, 2026-08-17.
+ *
+ * A held CLOSE survives frame loss through the renewal cadence; an OPEN had no second
+ * chance: relay_dirty cleared at enqueue, no renewal re-carries an open, and the loss path
+ * re-armed diag and prov but not RELAY. One cross-tie open swallowed by a USB disturbance
+ * during a site AC collapse was therefore never re-sent — the board held the tie to the end
+ * of its dead-man lease, honestly reported it closed, and the release confirm convicted a
+ * healthy contactor as welded (EVSE-PWR-0707, latched until an operator attended).
+ *
+ * The property under test: an intent is not quietly abandoned. A lost RELAY frame re-arms
+ * relay_dirty, so the CURRENT desired state goes out again as soon as the wire gives it a
+ * slot. The board-side counter is what proves delivery — the controller believing it sent
+ * an open is exactly the lie the incident was made of. */
+TEST(a_lost_open_is_resent_until_the_board_receives_it)
+{
+    cbctl_link_t link;
+    cbctl_loopback_t lb;
+    uint32_t now = 1000u;
+    unsigned seen_before;
+
+    bring_up(&link, &lb, &now);
+    CHECK(cbctl_relay_close(&link, CBPLC_RELAY_GUN, 3000u, NULL) == CBCTL_OK);
+    for (int i = 0; i < 20; i++) {
+        round_trip(&link, &lb, &now, 100u);
+    }
+    CHECK(lb.relay_seen > 0u);
+    CHECK((lb.last_relay_state & CBPLC_RELAY_GUN) != 0u);
+
+    /* The board stops servicing RELAY, and in that window the controller commands the open.
+     * The frame and every stop-and-wait retry of it are swallowed. */
+    lb.swallow_type = (uint8_t)CBPLC_T_RELAY;
+    CHECK(cbctl_relay_open(&link, CBPLC_RELAY_GUN, NULL) == CBCTL_OK);
+    for (int i = 0; i < 100; i++) {
+        round_trip(&link, &lb, &now, 100u);
+    }
+
+    /* The wire heals. Without the re-arm nothing is left to send — the open was abandoned
+     * at the first loss and the board never learns the contactor should be released. */
+    lb.swallow_type = 0u;
+    seen_before = lb.relay_seen;
+    for (int i = 0; i < 60; i++) {
+        round_trip(&link, &lb, &now, 100u);
+    }
+    CHECK(lb.relay_seen > seen_before);
+    CHECK((lb.last_relay_state & CBPLC_RELAY_GUN) == 0u);
+}
+
 /* THE CALLER'S PASS RATE IS A SAFETY PARAMETER, AND NOTHING SAID SO.
  *
  * issue_one() is a first-match-wins chain: every branch returns, so whichever obligation
@@ -1786,6 +1833,7 @@ int main(void)
     RUN(a_swallowed_provision_reply_is_retried_then_bounded);
     RUN(every_obligation_survives_a_slow_caller);
     RUN(a_lost_relay_renewal_does_not_crash_or_forge_an_ack);
+    RUN(a_lost_open_is_resent_until_the_board_receives_it);
     RUN(restart_is_refused_while_holding_a_contactor);
     RUN(a_board_that_refuses_a_restart_reports_the_gate);
     if (g_fail) {

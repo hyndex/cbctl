@@ -214,6 +214,10 @@ static void plc_on_message(void *user, const cbplc_msg_t *msg, cbplc_err_t statu
         if (lb->safety_undoes_closes && msg->payload_len >= 2u && msg->payload[1] != 0u) {
             lb->relay_safety_opens++;
         }
+        if (msg->payload_len >= 2u) {
+            lb->relay_seen++;
+            lb->last_relay_state = msg->payload[1];
+        }
         break;
     case CBPLC_T_LIMITS:    lb->limits_seen++;    break;
     case CBPLC_T_FEEDBACK:
