@@ -572,6 +572,51 @@ TEST(a_lease_is_released_when_the_session_ends)
     CHECK((link.relay_state & CBPLC_RELAY_ALL) == 0u);   /* we stopped asking */
 }
 
+/* THE AC FEED IS NOT THE SESSION'S TO RELEASE — evse-vscs8, 2026-10-13.
+ *
+ * Relay 3 is closed on physical presence and feeds modules other guns share. A session that
+ * ends with the car still plugged in releases the gun and must leave the feed held AND
+ * renewed: the controller sends relays on change only, so a bit dropped here is never asked
+ * for again, and the gun sits on dark modules (EVSE-MOD-0303) until the link is rebuilt. */
+TEST(the_ac_feed_outlives_the_session)
+{
+    cbctl_link_t link;
+    cbctl_loopback_t lb;
+    uint32_t now = 1000u;
+
+    bring_up(&link, &lb, &now);
+    lb.cp = 'B';
+    CHECK(cbctl_relay_close(&link, CBPLC_RELAY_POWER, CBCTL_RELAY_HOLD_RECOMMENDED_MS, NULL) ==
+          CBCTL_OK);
+    lb.secc_active = true;
+    for (int i = 0; i < 8; i++) {
+        step(&link, &lb, &now, 600u);
+    }
+    CHECK(cbctl_flag(&link, CBCTL_FLAG_SESSION_ACTIVE));
+    CHECK(cbctl_relay_close(&link, CBPLC_RELAY_GUN, CBCTL_RELAY_HOLD_RECOMMENDED_MS, NULL) ==
+          CBCTL_OK);
+    for (int i = 0; i < 6; i++) {
+        step(&link, &lb, &now, 400u);
+    }
+
+    lb.secc_active = false;   /* the session ends; the car stays plugged in */
+    for (int i = 0; i < 8; i++) {
+        step(&link, &lb, &now, 600u);
+    }
+    CHECK(link.lease_released_no_session > 0u);
+    CHECK((link.relay_state & CBPLC_RELAY_ENERGY) == 0u);   /* the gun is released */
+    CHECK((link.relay_state & CBPLC_RELAY_POWER) != 0u);    /* the AC feed is not */
+
+    /* Still RENEWED, not merely remembered: an unrenewed lease lapses on the board just the
+     * same as an explicit open. */
+    const unsigned seen = lb.relay_seen;
+    for (int i = 0; i < 20; i++) {
+        step(&link, &lb, &now, 1000u);
+    }
+    CHECK(lb.relay_seen > seen);
+    CHECK((lb.last_relay_state & CBPLC_RELAY_POWER) != 0u);
+}
+
 /* The EV's requested voltage must be visible from PreCharge, not only during delivery — a
  * charger that waits for "energised" before producing volts deadlocks: the EV will not close
  * its contactor until the bus is already near its target. */
@@ -1007,6 +1052,7 @@ int main(void)
     RUN(a_close_the_board_keeps_undoing_is_abandoned_loudly);
     RUN(ev_soc_is_reported_and_unknown_is_not_zero);
     RUN(a_lease_is_released_when_the_session_ends);
+    RUN(the_ac_feed_outlives_the_session);
     RUN(the_ev_target_is_visible_before_energised);
     RUN(a_truncated_line_applies_nothing_at_all);
     RUN(the_overflow_marker_is_counted_not_discarded);

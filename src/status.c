@@ -697,7 +697,15 @@ void cbctl_status_apply(cbctl_link_t *link, const uint8_t *payload, size_t len, 
              * safety layer opens a contactor it has no session for, our renewal closes it
              * again, and the result is the audible relay flipping the operator reported.
              * Releasing here makes the caller re-establish the close for the NEXT session,
-             * which is the only thing that could justify one. */
+             * which is the only thing that could justify one.
+             *
+             * THE ENERGY RELAYS ONLY. Relay 3 is the AC feed to modules that several guns
+             * share; no session justified it, physical presence did, and it outlives the
+             * session by design. This released it with the gun — the same mistake cbplc
+             * fixed on its own session-end path (d4b0184) — and a controller that sends
+             * relays only on change never asked again. evse-vscs8, 2026-10-13: a remote stop
+             * with the car left plugged in dropped the AC feed to both GWBZ modules, and the
+             * gun sat on EVSE-MOD-0303 for nine minutes until a USB glitch rebuilt the link. */
             /* THE EV'S TARGET MUST NOT OUTLIVE THE EV'S SESSION.
              *
              * cbplc clears its own target when a session STARTS, not when one ends, so between
@@ -708,8 +716,8 @@ void cbctl_status_apply(cbctl_link_t *link, const uint8_t *payload, size_t len, 
             link->ev_target_mv = 0u;
             link->ev_target_ma = 0u;
             link->ev_target_valid = false;
-            if ((link->relay_state & CBPLC_RELAY_ALL) != 0u) {
-                link->relay_state = 0u;
+            if ((link->relay_state & CBPLC_RELAY_ENERGY) != 0u) {
+                link->relay_state = (uint8_t)(link->relay_state & ~CBPLC_RELAY_ENERGY);
                 link->relay_dirty = true;
                 link->lease_released_no_session++;
             }
